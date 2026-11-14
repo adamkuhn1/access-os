@@ -1,6 +1,6 @@
 
 import { browser } from 'wxt/browser';
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import './App.css';
 
 type PageElement = {
@@ -31,9 +31,29 @@ type PendingFormControl = {
   tabId: number;
 };
 
+type SpeechResultEvent = {
+  resultIndex: number;
+  results: ArrayLike<{
+    isFinal: boolean;
+    [index: number]: { transcript: string };
+  }>;
+};
+
+type SpeechRecognizer = {
+  lang: string;
+  continuous: boolean;
+  interimResults: boolean;
+  onresult: ((event: SpeechResultEvent) => void) | null;
+  onerror: ((event: { error: string }) => void) | null;
+  onend: (() => void) | null;
+  start: () => void;
+  stop: () => void;
+};
+
 function App() {
   const [status, setStatus] = useState('Ready');
   const [command, setCommand] = useState('');
+  const [listening, setListening] = useState(false);
 
   const [selectedLink, setSelectedLink] =
     useState<SelectedLink | null>(null);
@@ -41,12 +61,45 @@ function App() {
   const [pendingForm, setPendingForm] =
     useState<PendingFormControl | null>(null);
 
-  // Ask Claude to interpret a command
-  async function handleAskClaude() {
+  // Voice mode references
+  const voiceActiveRef = useRef(false);
+  const recognitionRef = useRef<SpeechRecognizer | null>(null);
+
+  // Keep the latest proposed actions available to voice mode
+  const latestActionsRef = useRef({
+    pendingForm,
+    selectedLink,
+    confirmForm: handleConfirmForm,
+    confirmNavigation: handleConfirmNavigation,
+  });
+
+  useEffect(() => {
+    latestActionsRef.current = {
+      pendingForm,
+      selectedLink,
+      confirmForm: handleConfirmForm,
+      confirmNavigation: handleConfirmNavigation,
+    };
+  });
+
+  // Clean up the microphone if the popup closes
+  useEffect(() => {
+    return () => {
+      voiceActiveRef.current = false;
+      recognitionRef.current?.stop();
+      recognitionRef.current = null;
+    };
+  }, []);
+
+  // --------------------------------------------------
+  // 1. ASK CLAUDE
+  // --------------------------------------------------
+
+  async function handleAskClaude(inputCommand = command) {
     setSelectedLink(null);
     setPendingForm(null);
 
-    if (!command.trim()) {
+    if (!inputCommand.trim()) {
       setStatus('Please enter a command.');
       return;
     }
@@ -63,7 +116,6 @@ function App() {
         throw new Error('No active tab found');
       }
 
-      // Scan the current webpage
       const pageData = await browser.tabs.sendMessage(
         tab.id,
         { type: 'GET_PAGE_ELEMENTS' }
@@ -73,7 +125,6 @@ function App() {
 
       setStatus('Asking Claude...');
 
-      // Send the instruction to our AI backend
       const response = await fetch(
         'http://127.0.0.1:3001/interpret',
         {
@@ -82,7 +133,7 @@ function App() {
             'Content-Type': 'application/json',
           },
           body: JSON.stringify({
-            command: command.trim(),
+            command: inputCommand.trim(),
             elements,
           }),
         }
@@ -99,7 +150,6 @@ function App() {
         return;
       }
 
-      // Find the element Claude selected
       const selected = elements.find(
         (element) => element.id === result.elementId
       );
@@ -108,7 +158,6 @@ function App() {
         throw new Error('Invalid element selected');
       }
 
-      // Highlight the element on the webpage
       const highlightResult = await browser.tabs.sendMessage(
         tab.id,
         {
@@ -122,7 +171,7 @@ function App() {
         return;
       }
 
-      // NAVIGATION ACTION
+      // Navigation
       if (result.action === 'click') {
         if (
           selected.role !== 'link' ||
@@ -143,7 +192,7 @@ function App() {
         return;
       }
 
-      // UNIVERSAL FORM ACTION
+      // Universal Form Engine
       if (result.action === 'set') {
         if (
           !['input', 'textarea', 'select'].includes(
@@ -159,7 +208,6 @@ function App() {
 
         let displayValue = String(result.value);
 
-        // Make checkboxes and radio buttons readable
         if (selected.inputType === 'checkbox') {
           displayValue = result.value
             ? 'Check'
@@ -168,7 +216,6 @@ function App() {
           displayValue = 'Select';
         }
 
-        // Display dropdown option labels instead of IDs
         if (selected.role === 'select') {
           const option = selected.options?.find(
             (item) => item.value === result.value
@@ -192,14 +239,16 @@ function App() {
       }
 
       setStatus('Unsupported AI action.');
-
     } catch (error) {
       console.error(error);
       setStatus('Error connecting to Claude. Check console.');
     }
   }
 
-  // Confirm and open a link
+  // --------------------------------------------------
+  // 2. CONFIRM NAVIGATION
+  // --------------------------------------------------
+
   async function handleConfirmNavigation() {
     if (!selectedLink) return;
 
@@ -234,7 +283,6 @@ function App() {
       );
 
       setSelectedLink(null);
-
     } catch (error) {
       console.error(error);
       setStatus('Navigation failed.');
@@ -242,7 +290,10 @@ function App() {
     }
   }
 
-  // Confirm and apply a form change
+  // --------------------------------------------------
+  // 3. CONFIRM FORM CHANGE
+  // --------------------------------------------------
+
   async function handleConfirmForm() {
     if (!pendingForm) return;
 
@@ -260,7 +311,6 @@ function App() {
         return;
       }
 
-      // Universal Form Engine
       const result = await browser.tabs.sendMessage(
         pendingForm.tabId,
         {
@@ -278,13 +328,183 @@ function App() {
       );
 
       setPendingForm(null);
-
     } catch (error) {
       console.error(error);
       setStatus('Form update failed.');
       setPendingForm(null);
     }
   }
+
+  // --------------------------------------------------
+  // 4. STOP VOICE MODE
+  // --------------------------------------------------
+
+  function stopVoice() {
+    voiceActiveRef.current = false;
+
+    recognitionRef.current?.stop();
+    recognitionRef.current = null;
+
+    setListening(false);
+    setStatus('Voice mode off.');
+  }
+
+  // --------------------------------------------------
+  // 5. CONTINUOUS VOICE MODE
+  // --------------------------------------------------
+
+  function handleVoice() {
+    // Toggle voice mode off
+    if (voiceActiveRef.current) {
+      stopVoice();
+      return;
+    }
+
+    const speechWindow = window as Window & {
+      SpeechRecognition?: new () => SpeechRecognizer;
+      webkitSpeechRecognition?: new () => SpeechRecognizer;
+    };
+
+    const Recognition =
+      speechWindow.SpeechRecognition ||
+      speechWindow.webkitSpeechRecognition;
+
+    if (!Recognition) {
+      setStatus('Speech recognition is not supported.');
+      return;
+    }
+
+    const recognition = new Recognition();
+
+    recognition.lang = 'en-US';
+    recognition.continuous = true;
+    recognition.interimResults = false;
+
+    // Process each completed spoken phrase
+    recognition.onresult = (event) => {
+      for (
+        let i = event.resultIndex;
+        i < event.results.length;
+        i++
+      ) {
+        const result = event.results[i];
+
+        if (!result?.isFinal) continue;
+
+        const transcript = result[0]?.transcript?.trim();
+
+        if (!transcript) continue;
+
+        const spoken = transcript
+          .toLowerCase()
+          .replace(/[.!?]+$/, '');
+
+        const actions = latestActionsRef.current;
+
+        console.log('Voice command:', transcript);
+
+        // Stop listening by voice
+        if (
+          [
+            'stop listening',
+            'turn off voice mode',
+            'microphone off',
+          ].includes(spoken)
+        ) {
+          stopVoice();
+          return;
+        }
+
+        // Confirm a proposed action
+        if (
+          ['confirm', 'yes', 'go ahead'].includes(spoken)
+        ) {
+          if (actions.pendingForm) {
+            void actions.confirmForm();
+          } else if (actions.selectedLink) {
+            void actions.confirmNavigation();
+          } else {
+            setStatus('Nothing to confirm yet.');
+          }
+
+          continue;
+        }
+
+        // Cancel a proposed action
+        if (
+          ['cancel', 'no', 'stop'].includes(spoken)
+        ) {
+          setPendingForm(null);
+          setSelectedLink(null);
+          setStatus('Action canceled.');
+          continue;
+        }
+
+        // Otherwise, send a new command to Claude
+        setCommand(transcript);
+        setSelectedLink(null);
+        setPendingForm(null);
+
+        void handleAskClaude(transcript);
+      }
+    };
+
+    recognition.onerror = (event) => {
+      if (!voiceActiveRef.current) return;
+
+      // Chrome may report silence in continuous mode.
+      if (event.error === 'no-speech') return;
+
+      voiceActiveRef.current = false;
+      recognitionRef.current = null;
+
+      setListening(false);
+      setStatus(`Microphone error: ${event.error}`);
+    };
+
+    recognition.onend = () => {
+      // Automatically restart if voice mode is still enabled
+      if (voiceActiveRef.current) {
+        try {
+          recognition.start();
+        } catch (error) {
+          console.error(error);
+
+          voiceActiveRef.current = false;
+          recognitionRef.current = null;
+
+          setListening(false);
+          setStatus(
+            'Listening stopped. Start Voice Mode again.'
+          );
+        }
+      } else {
+        setListening(false);
+      }
+    };
+
+    try {
+      recognitionRef.current = recognition;
+      voiceActiveRef.current = true;
+
+      recognition.start();
+
+      setListening(true);
+      setStatus('Voice mode active. Speak a command.');
+    } catch (error) {
+      console.error(error);
+
+      voiceActiveRef.current = false;
+      recognitionRef.current = null;
+
+      setListening(false);
+      setStatus('Could not start microphone.');
+    }
+  }
+
+  // --------------------------------------------------
+  // 6. USER INTERFACE
+  // --------------------------------------------------
 
   return (
     <main>
@@ -303,7 +523,20 @@ function App() {
         }}
       />
 
-      <button type="button" onClick={handleAskClaude}>
+      <button
+        type="button"
+        onClick={handleVoice}
+        aria-pressed={listening}
+      >
+        {listening
+          ? '🔴 Stop Listening'
+          : '🎤 Start Listening'}
+      </button>
+
+      <button
+        type="button"
+        onClick={() => void handleAskClaude()}
+      >
         Ask Claude
       </button>
 

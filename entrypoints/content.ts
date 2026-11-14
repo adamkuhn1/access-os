@@ -14,7 +14,8 @@ export default defineContentScript({
     const cursor = document.createElement('div');
     cursor.setAttribute('aria-hidden', 'true');
     cursor.innerHTML = `
-      <svg width="28" height="28" viewBox="0 0 24 24">
+      <svg width="28" height="28" viewBox="0 0 24 24"
+        style="display: block; transform-origin: 2px 2px">
         <path d="M2 2 L2 19 L6.5 15 L9.5 22 L12.8 20.6 L9.8 13.8 L16 13.8 Z"
           fill="#14b8a6" stroke="#ffffff" stroke-width="1.5"
           stroke-linejoin="round" />
@@ -82,6 +83,76 @@ export default defineContentScript({
       }
 
       requestAnimationFrame(frame);
+    }
+
+    // just the visual click, the form handler still does the real work.
+    // doesn't wait for anything so the form update isn't delayed
+    function showCursorClick(target: HTMLElement) {
+      if (!cursor.isConnected) {
+        document.documentElement.appendChild(cursor);
+      }
+
+      // stop any move still running and jump to the target, which also
+      // covers the cursor having already faded out
+      cursorRun++;
+      window.clearTimeout(hideTimer);
+
+      const rect = target.getBoundingClientRect();
+      cursorX = rect.left + rect.width / 2;
+      cursorY = rect.top + rect.height / 2;
+      cursor.style.transform = `translate(${cursorX}px, ${cursorY}px)`;
+      cursor.style.opacity = '1';
+
+      const ring = document.createElement('div');
+      ring.setAttribute('aria-hidden', 'true');
+      Object.assign(ring.style, {
+        position: 'fixed',
+        left: `${cursorX - 20}px`,
+        top: `${cursorY - 20}px`,
+        width: '40px',
+        height: '40px',
+        boxSizing: 'border-box',
+        border: '3px solid #14b8a6',
+        borderRadius: '50%',
+        boxShadow: '0 0 0 1px #ffffff',
+        opacity: '0',
+        zIndex: '2147483646',
+        pointerEvents: 'none',
+      });
+      document.documentElement.appendChild(ring);
+
+      const reduceMotion = window.matchMedia(
+        '(prefers-reduced-motion: reduce)'
+      ).matches;
+
+      // reduced motion: no shrink or expanding ring, just a quick fade
+      const ringAnimation = reduceMotion
+        ? ring.animate([{ opacity: 1 }, { opacity: 0 }], {
+            duration: 300,
+          })
+        : ring.animate(
+            [
+              { transform: 'scale(0.3)', opacity: 1 },
+              { transform: 'scale(1)', opacity: 0 },
+            ],
+            { duration: 300, easing: 'ease-out' }
+          );
+      ringAnimation.onfinish = () => ring.remove();
+
+      if (!reduceMotion) {
+        cursor.firstElementChild?.animate(
+          [
+            { transform: 'scale(1)' },
+            { transform: 'scale(0.8)' },
+            { transform: 'scale(1)' },
+          ],
+          { duration: 200 }
+        );
+      }
+
+      hideTimer = window.setTimeout(() => {
+        cursor.style.opacity = '0';
+      }, 1500);
     }
 
     browser.runtime.onMessage.addListener(
@@ -404,6 +475,8 @@ export default defineContentScript({
               return;
             }
 
+            showCursorClick(target);
+
             if (target.checked !== value) {
               target.click();
             }
@@ -474,6 +547,7 @@ export default defineContentScript({
               return;
             }
 
+            showCursorClick(target);
             setter.call(target, value);
 
             if (target.value !== value) {
@@ -544,6 +618,7 @@ export default defineContentScript({
               return;
             }
 
+            showCursorClick(target);
             setter.call(target, option.value);
 
             target.dispatchEvent(

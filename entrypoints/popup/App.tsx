@@ -31,6 +31,23 @@ type PendingFormControl = {
   tabId: number;
 };
 
+const AGENT_MAX_STEPS = 5;
+
+// same idea as the backend filter, checked again before we touch anything
+const SENSITIVE_FIELD =
+  /password|passcode|card ?number|credit|debit|cvv|cvc|security code|expir|iban|routing|account number|ssn|social security/i;
+
+const sleep = (ms: number) =>
+  new Promise((resolve) => setTimeout(resolve, ms));
+
+type AgentHistoryStep = {
+  action: 'set';
+  elementId: number;
+  text: string;
+  value: string | boolean;
+  success: true;
+};
+
 type AgentPreview = {
   action: string;
   target?: string;
@@ -76,6 +93,13 @@ function App({ inSidePanel = false }: { inSidePanel?: boolean }) {
   const [agentLoading, setAgentLoading] = useState(false);
   const [agentPreview, setAgentPreview] =
     useState<AgentPreview | null>(null);
+
+  const [agentRunning, setAgentRunning] = useState(false);
+  const [agentProgress, setAgentProgress] = useState('');
+  const [agentSteps, setAgentSteps] = useState<string[]>([]);
+  const [agentResult, setAgentResult] = useState('');
+  const agentRunningRef = useRef(false);
+  const agentStopRef = useRef(false);
 
   // recognition callbacks would otherwise see stale state
   const latestActionsRef = useRef({
@@ -663,6 +687,230 @@ function App({ inSidePanel = false }: { inSidePanel?: boolean }) {
     }
   }
 
+  // runs set actions only, on the tab and page it started on, until Claude
+  // says done/ask/none, something fails, the user stops it, or we hit the limit
+  async function handleRunFormTask() {
+    if (agentRunningRef.current || agentLoading) return;
+
+    const goal = agentGoal.trim();
+
+    if (!goal) {
+      setAgentResult('Please enter a goal first.');
+      return;
+    }
+
+    agentRunningRef.current = true;
+    agentStopRef.current = false;
+    setAgentRunning(true);
+    setAgentPreview(null);
+    setAgentSteps([]);
+    setAgentResult('');
+    setAgentProgress('Starting...');
+
+    const history: AgentHistoryStep[] = [];
+    let finalMessage = '';
+
+    try {
+      const [tab] = await browser.tabs.query({
+        active: true,
+        currentWindow: true,
+      });
+
+      if (!tab?.id || !tab.url) {
+        throw new Error('No active tab found.');
+      }
+
+      const tabId = tab.id;
+      const startUrl = tab.url;
+
+      // throws if the user hit Stop or the tab/page changed under us
+      const checkStillOk = async () => {
+        if (agentStopRef.current) throw new Error('Stopped by user.');
+
+        const [current] = await browser.tabs.query({
+          active: true,
+          currentWindow: true,
+        });
+
+        if (agentStopRef.current) throw new Error('Stopped by user.');
+
+        if (current?.id !== tabId || current.url !== startUrl) {
+          throw new Error('The tab or page changed, so the agent stopped.');
+        }
+      };
+
+      for (let step = 1; ; step++) {
+        if (history.length >= AGENT_MAX_STEPS) {
+          finalMessage = `Stopped at the ${AGENT_MAX_STEPS}-step safety limit. Check the rest of the form yourself.`;
+          break;
+        }
+
+        await checkStillOk();
+        setAgentProgress(`Step ${step}: scanning the page...`);
+
+        const pageData = await browser.tabs.sendMessage(tabId, {
+          type: 'GET_PAGE_ELEMENTS',
+        });
+        await checkStillOk();
+
+        const elements = pageData.elements as PageElement[];
+
+        setAgentProgress(`Step ${step}: asking Claude what to do next...`);
+
+        const response = await fetch(
+          'http://127.0.0.1:3001/agent/next',
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              goal,
+              url: startUrl,
+              elements,
+              history,
+            }),
+          }
+        );
+
+        const result = await response.json();
+        await checkStillOk();
+
+        if (!response.ok) {
+          throw new Error(result.error || `Backend error: ${response.status}`);
+        }
+
+        if (result.action === 'done') {
+          finalMessage = `Done: ${result.message} The form was not submitted.`;
+          break;
+        }
+
+        if (result.action === 'ask') {
+          finalMessage = `Claude needs more info: ${result.message}`;
+          break;
+        }
+
+        if (result.action === 'none') {
+          finalMessage = `Stopped: ${result.message}`;
+          break;
+        }
+
+        if (result.action !== 'set') {
+          throw new Error(
+            result.action === 'click'
+              ? 'Claude wanted to open a link, but Agent Mode only edits form fields here. Stopped.'
+              : 'Claude returned an unsupported action. Stopped.'
+          );
+        }
+
+        const target = elements.find(
+          (element) => element.id === result.elementId
+        );
+
+        if (!target) {
+          throw new Error('Claude picked a field that is not on the page.');
+        }
+
+        if (
+          SENSITIVE_FIELD.test(target.text) ||
+          target.inputType === 'password'
+        ) {
+          throw new Error(`Refused to edit a sensitive field ("${target.text}").`);
+        }
+
+        const value = result.value as string | boolean;
+        const shownValue =
+          typeof value === 'boolean'
+            ? value
+              ? 'checked / selected'
+              : 'unchecked'
+            : `"${value}"`;
+
+        setAgentProgress(
+          `Step ${step}: setting "${target.text}" to ${shownValue}`
+        );
+
+        const highlight = await browser.tabs.sendMessage(tabId, {
+          type: 'HIGHLIGHT_ELEMENT',
+          elementId: target.id,
+        });
+        await checkStillOk();
+
+        if (!highlight?.success) {
+          throw new Error(`Could not find "${target.text}" on the page.`);
+        }
+
+        // let the cursor get there before acting
+        await sleep(700);
+        await checkStillOk();
+
+        // the user authorized form edits by pressing Run Form Task
+        const applied = await browser.tabs.sendMessage(tabId, {
+          type: 'SET_FORM_CONTROL',
+          elementId: target.id,
+          value,
+          confirmed: true,
+        });
+
+        if (!applied?.success) {
+          throw new Error(
+            `Could not update "${target.text}": ${applied?.error ?? 'unknown error'}`
+          );
+        }
+
+        // give page scripts a moment, then read the control back
+        await sleep(300);
+
+        const state = await browser.tabs.sendMessage(tabId, {
+          type: 'GET_CONTROL_STATE',
+          elementId: target.id,
+        });
+
+        let verified = false;
+
+        if (state?.success) {
+          if (typeof value === 'boolean') {
+            verified = state.checked === value;
+          } else if (target.role === 'select') {
+            verified =
+              state.value === value ||
+              state.text?.toLowerCase() === value.toLowerCase();
+          } else {
+            verified = state.value === value;
+          }
+        }
+
+        if (!verified) {
+          throw new Error(
+            `Verification failed: "${target.text}" doesn't show the expected value, so the agent stopped.`
+          );
+        }
+
+        history.push({
+          action: 'set',
+          elementId: target.id,
+          text: target.text,
+          value,
+          success: true,
+        });
+
+        setAgentSteps((steps) => [
+          ...steps,
+          `${target.text} → ${shownValue}`,
+        ]);
+
+        await sleep(300);
+      }
+    } catch (error) {
+      console.error(error);
+      finalMessage =
+        error instanceof Error ? error.message : 'The agent run failed.';
+    } finally {
+      agentRunningRef.current = false;
+      setAgentRunning(false);
+      setAgentProgress('');
+      setAgentResult(finalMessage);
+    }
+  }
+
   async function handleOpenSidePanel() {
     try {
       const currentWindow = await browser.windows.getCurrent();
@@ -802,10 +1050,56 @@ function App({ inSidePanel = false }: { inSidePanel?: boolean }) {
         <button
           type="button"
           onClick={() => void handlePreviewNextStep()}
-          disabled={agentLoading}
+          disabled={agentLoading || agentRunning}
         >
           {agentLoading ? 'Thinking...' : 'Preview Next Step'}
         </button>
+
+        <button
+          type="button"
+          onClick={() => void handleRunFormTask()}
+          disabled={agentLoading || agentRunning}
+          aria-describedby="run-form-task-help"
+        >
+          Run Form Task
+        </button>
+
+        <p id="run-form-task-help">
+          Run Form Task fills in fields on this page for this goal. It never
+          clicks buttons or links, opens other pages, or submits the form.
+        </p>
+
+        {agentRunning && (
+          <>
+            <button
+              type="button"
+              onClick={() => {
+                agentStopRef.current = true;
+                setAgentProgress('Stopping...');
+              }}
+            >
+              Stop Agent
+            </button>
+            <p>No new steps will start. A change already underway may finish.</p>
+          </>
+        )}
+
+        <div aria-live="polite">
+          {agentProgress && <p>{agentProgress}</p>}
+
+          {agentSteps.length > 0 && (
+            <>
+              <h3>Completed steps</h3>
+              <ol>
+                {agentSteps.map((step, index) => (
+                  <li key={index}>{step}</li>
+                ))}
+              </ol>
+            </>
+          )}
+
+          {agentResult && <p>{agentResult}</p>}
+        </div>
 
         <div aria-live="polite">
           {agentPreview?.action === 'error' && (

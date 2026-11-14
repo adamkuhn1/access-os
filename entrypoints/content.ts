@@ -647,6 +647,49 @@ export default defineContentScript({
           });
           return;
         }
+
+        // read back one control so the agent can verify its own change.
+        // stays in the extension, never sent to the backend
+        if (
+          message.type === 'GET_CONTROL_STATE' &&
+          typeof message.elementId === 'number'
+        ) {
+          const target = elementById.get(message.elementId);
+
+          if (!target || !target.isConnected) {
+            sendResponse({ success: false });
+            return;
+          }
+
+          if (
+            target instanceof HTMLInputElement &&
+            ['checkbox', 'radio'].includes(target.type)
+          ) {
+            sendResponse({ success: true, checked: target.checked });
+            return;
+          }
+
+          if (
+            (target instanceof HTMLInputElement &&
+              target.type !== 'password') ||
+            target instanceof HTMLTextAreaElement
+          ) {
+            sendResponse({ success: true, value: target.value });
+            return;
+          }
+
+          if (target instanceof HTMLSelectElement) {
+            sendResponse({
+              success: true,
+              value: target.value,
+              text: target.selectedOptions[0]?.text.trim() ?? '',
+            });
+            return;
+          }
+
+          sendResponse({ success: false });
+          return;
+        }
       }
     );
   },

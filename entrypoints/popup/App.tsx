@@ -18,13 +18,22 @@ type SelectedLink = {
 
 };
 
+type PendingFill = {
+  id: number;
+  text: string;
+  value: string;
+  tabId: number;
+};
+
 function App() {
   const [status, setStatus] = useState('Ready');
   const [linkText, setLinkText] = useState('Learn more');
+  const [pendingFill, setPendingFill] = useState<PendingFill | null>(null);
   const [selectedLink, setSelectedLink] =
     useState<SelectedLink | null>(null);
 
   async function handleTest() {
+    setPendingFill(null);
     setStatus('Scanning webpage...');
     setSelectedLink(null);
 
@@ -78,9 +87,9 @@ function App() {
 
       // Handle no matching element
       if (result.action === 'none') {
-        setStatus('Claude could not find a matching element.');
-        return;
-      }
+  setStatus('Claude could not find a matching element.');
+  return;
+}
 
       // Find Claude's selected element
       const selected = elements.find(
@@ -104,6 +113,34 @@ function App() {
         setStatus('Could not highlight the selected element.');
         return;
       }
+
+
+
+if (result.action === 'fill') {
+  if (
+    selected.role !== 'input' ||
+    typeof result.value !== 'string'
+  ) {
+    setStatus('Invalid text-entry action.');
+    return;
+  }
+
+  // Save Claude's proposed text entry
+  setPendingFill({
+    id: selected.id,
+    text: selected.text,
+    value: result.value,
+    tabId: tab.id,
+  });
+
+  setStatus(
+    `Claude wants to enter "${result.value}" in ${selected.text}`
+  );
+
+  return;
+}
+
+
 
       setStatus(`Highlighted: ${selected.text}`);
 
@@ -170,6 +207,53 @@ async function handleConfirm() {
 }
 
 
+
+
+
+async function handleConfirmFill() {
+  if (!pendingFill) return;
+
+  setStatus('Filling field...');
+
+  try {
+    // Check that we're still on the correct tab
+    const [activeTab] = await browser.tabs.query({
+      active: true,
+      currentWindow: true,
+    });
+
+    if (activeTab?.id !== pendingFill.tabId) {
+      setStatus('Tab changed. Please ask Claude again.');
+      setPendingFill(null);
+      return;
+    }
+
+    // Send the approved text-entry action
+    const response = await browser.tabs.sendMessage(
+      pendingFill.tabId,
+      {
+        type: 'FILL_TEXT_INPUT',
+        elementId: pendingFill.id,
+        value: pendingFill.value,
+        confirmed: true,
+      }
+    );
+
+    if (response.success) {
+      setStatus(`Filled: ${pendingFill.text}`);
+    } else {
+      setStatus(response.error || 'Could not fill field.');
+    }
+
+    setPendingFill(null);
+  } catch (error) {
+    console.error(error);
+    setStatus('Text entry failed.');
+    setPendingFill(null);
+  }
+}
+
+
   return (
     <main>
       <h1>Access OS</h1>
@@ -179,9 +263,10 @@ async function handleConfirm() {
         type="text"
         value={linkText}
         onChange={(e) => {
-          setLinkText(e.target.value);
-          setSelectedLink(null);
-        }}
+  setLinkText(e.target.value);
+  setSelectedLink(null);
+  setPendingFill(null);
+}}
         placeholder="What would you like to do?"
         aria-label="Command"
       />
@@ -191,6 +276,29 @@ async function handleConfirm() {
       </button>
 
       <p role="status">Status: {status}</p>
+
+
+{pendingFill && (
+  <div>
+    <h3>Proposed Text Entry</h3>
+
+    <p><strong>Field:</strong> {pendingFill.text}</p>
+    <p><strong>Value:</strong> {pendingFill.value}</p>
+<button type="button" onClick={handleConfirmFill}>
+  Confirm & Fill
+</button>
+    <button
+      type="button"
+      onClick={() => {
+        setPendingFill(null);
+        setStatus('Text entry canceled.');
+      }}
+    >
+      Cancel
+    </button>
+  </div>
+)}
+
 
       {selectedLink && (
         <div>

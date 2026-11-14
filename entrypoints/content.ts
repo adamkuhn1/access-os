@@ -44,13 +44,15 @@ export default defineContentScript({
 
           // Find links
           const links = Array.from(
-  document.querySelectorAll<HTMLAnchorElement>('a[href]')
-).map((link) => ({
-  element: link,
-  text: link.getAttribute('aria-label') || link.textContent?.trim(),
-  role: 'link',
-  href: link.href,
-}));
+            document.querySelectorAll<HTMLAnchorElement>('a[href]')
+          ).map((link) => ({
+            element: link,
+            text:
+              link.getAttribute('aria-label') ||
+              link.textContent?.trim(),
+            role: 'link',
+            href: link.href,
+          }));
 
           // Find buttons
           const buttons = Array.from(
@@ -77,6 +79,7 @@ export default defineContentScript({
               input.name ||
               input.id,
             role: 'input',
+            inputType: input.type,
           }));
 
           // Reset stored elements before a new scan
@@ -94,6 +97,8 @@ export default defineContentScript({
               // Send only descriptions to Claude
               return { id, text, role, ...details };
             });
+
+          console.log('Scanned elements:', elements);
 
           sendResponse({ elements });
           return;
@@ -162,8 +167,7 @@ export default defineContentScript({
             return;
           }
 
-
-          // Verify that the destination has not changed
+          // Verify that the destination hasn't changed
           if (
             typeof message.expectedHref !== 'string' ||
             target.href !== message.expectedHref
@@ -175,16 +179,78 @@ export default defineContentScript({
             return;
           }
 
-
           // Respond before the page navigates
           sendResponse({ success: true });
 
           setTimeout(() => {
-            if (target.isConnected) {
+            if (
+              target.isConnected &&
+              target.href === message.expectedHref
+            ) {
               target.click();
             }
           }, 100);
 
+          return;
+        }
+
+        // 5. Fill a text field
+        if (
+          message.type === 'FILL_TEXT_INPUT' &&
+          typeof message.elementId === 'number' &&
+          typeof message.value === 'string'
+        ) {
+          const target = elementById.get(message.elementId);
+
+          // Only allow editable text inputs
+          if (
+            !(target instanceof HTMLInputElement) ||
+            target.type !== 'text' ||
+            target.disabled ||
+            target.readOnly ||
+            !target.isConnected ||
+            message.value.length > 200
+          ) {
+            sendResponse({
+              success: false,
+              error: 'Invalid text field',
+            });
+            return;
+          }
+if (message.confirmed !== true) {
+  sendResponse({
+    success: false,
+    error: 'Confirmation required',
+  });
+  return;
+}
+          // Get the browser's native value setter
+          const setter = Object.getOwnPropertyDescriptor(
+            HTMLInputElement.prototype,
+            'value'
+          )?.set;
+
+          if (!setter) {
+            sendResponse({
+              success: false,
+              error: 'Cannot update field',
+            });
+            return;
+          }
+
+          // Insert the text into the field
+          setter.call(target, message.value);
+
+          // Notify the webpage of the change
+          target.dispatchEvent(
+            new Event('input', { bubbles: true })
+          );
+
+          target.dispatchEvent(
+            new Event('change', { bubbles: true })
+          );
+
+          sendResponse({ success: true });
           return;
         }
       }

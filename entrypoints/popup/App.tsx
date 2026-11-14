@@ -33,6 +33,10 @@ type PendingFormControl = {
 
 const AGENT_MAX_STEPS = 5;
 const AGENT_MAX_NAVIGATIONS = 2;
+const AGENT_MAX_SITE_CHANGES = 1;
+
+// plain http is only allowed for other sites when they're local dev servers
+const LOCAL_HOST = /^(localhost|127\.0\.0\.1|\[::1\])$|\.localhost$/;
 const PAGE_LOAD_TIMEOUT = 10000;
 
 // links the agent should never follow on its own
@@ -132,6 +136,14 @@ function App({ inSidePanel = false }: { inSidePanel?: boolean }) {
     null
   );
   const agentAbortRef = useRef<AbortController | null>(null);
+
+  // a link to another website, waiting for the user's ok. shares
+  // approvalResolveRef with the page-sharing prompt (only one is ever open)
+  const [navApproval, setNavApproval] = useState<{
+    label: string;
+    url: string;
+    origin: string;
+  } | null>(null);
 
   // recognition callbacks would otherwise see stale state
   const latestActionsRef = useRef({
@@ -820,11 +832,11 @@ function App({ inSidePanel = false }: { inSidePanel?: boolean }) {
       }
 
       const tabId = tab.id;
-      const startOrigin = new URL(tab.url).origin;
 
       // the page we expect to be on. only changes when the agent itself navigates
       let expectedUrl = tab.url;
       let navigations = 0;
+      let siteChanges = 0;
 
       const checkActiveTab = async () => {
         if (agentStopRef.current) throw new Error('Stopped by user.');
@@ -1027,10 +1039,26 @@ function App({ inSidePanel = false }: { inSidePanel?: boolean }) {
             throw new Error(`"${target.text}" is not a web link. Stopped.`);
           }
 
-          if (destination.origin !== startOrigin) {
-            throw new Error(
-              `"${target.text}" leads to another website (${destination.host}). The agent only follows links on the same site for now.`
-            );
+          // links on the current site are followed automatically, anything
+          // else needs the user's ok first
+          const currentOrigin = new URL(expectedUrl).origin;
+          const leavingSite = destination.origin !== currentOrigin;
+
+          if (leavingSite) {
+            if (siteChanges >= AGENT_MAX_SITE_CHANGES) {
+              throw new Error(
+                `"${target.text}" leads to another website, but the agent can only change websites once per run. Stopped.`
+              );
+            }
+
+            if (
+              destination.protocol !== 'https:' &&
+              !LOCAL_HOST.test(destination.hostname)
+            ) {
+              throw new Error(
+                `"${target.text}" leads to another website without HTTPS (${destination.host}), so the agent won't follow it.`
+              );
+            }
           }
 
           if (
@@ -1049,6 +1077,53 @@ function App({ inSidePanel = false }: { inSidePanel?: boolean }) {
 
           if (fromUrl.href === toUrl.href) {
             throw new Error(`"${target.text}" points to this same page. Stopped.`);
+          }
+
+          if (leavingSite) {
+            setAgentProgress(
+              `Step ${step}: waiting for you to allow leaving this website...`
+            );
+
+            const allowed = await new Promise<boolean>((resolve) => {
+              approvalResolveRef.current = resolve;
+              setNavApproval({
+                label: target.text,
+                url: destination.href,
+                origin: destination.origin,
+              });
+            });
+
+            approvalResolveRef.current = null;
+            setNavApproval(null);
+
+            if (agentStopRef.current) throw new Error('Stopped by user.');
+
+            if (!allowed) {
+              finalMessage = `Canceled: the agent did not open ${destination.host} and stayed on this page.`;
+              break;
+            }
+
+            // still the same tab and page the user was looking at?
+            await checkStillOk();
+
+            // and the link still points exactly where the user approved
+            const recheck = await browser.tabs.sendMessage(tabId, {
+              type: 'GET_PAGE_ELEMENTS',
+            });
+            await checkStillOk();
+
+            const sameLink = (recheck.elements as PageElement[]).find(
+              (element) =>
+                element.id === target.id &&
+                element.role === 'link' &&
+                element.href === destination.href
+            );
+
+            if (!sameLink) {
+              throw new Error(
+                'The link changed after you approved it, so the agent stopped.'
+              );
+            }
           }
 
           setAgentProgress(`Step ${step}: opening "${target.text}"`);
@@ -1102,15 +1177,17 @@ function App({ inSidePanel = false }: { inSidePanel?: boolean }) {
             }
           }
 
-          // redirects are fine as long as we stay on the same site
-          if (new URL(loadedUrl).origin !== startOrigin) {
+          // redirects are fine as long as we end up on the site we expected
+          // (the approved one, if we just left the old site)
+          if (new URL(loadedUrl).origin !== destination.origin) {
             throw new Error(
-              'The link redirected to another website, so the agent stopped.'
+              `The link redirected to an unexpected website (${new URL(loadedUrl).host}), so the agent stopped.`
             );
           }
 
           expectedUrl = loadedUrl;
           navigations++;
+          if (leavingSite) siteChanges++;
 
           history.push({
             action: 'click',
@@ -1122,7 +1199,9 @@ function App({ inSidePanel = false }: { inSidePanel?: boolean }) {
 
           setAgentSteps((steps) => [
             ...steps,
-            `Opened "${target.text}" → ${new URL(loadedUrl).pathname}`,
+            leavingSite
+              ? `Opened "${target.text}" → ${new URL(loadedUrl).host}${new URL(loadedUrl).pathname} (new website, approved by you)`
+              : `Opened "${target.text}" → ${new URL(loadedUrl).pathname}`,
           ]);
 
           continue;
@@ -1232,6 +1311,7 @@ function App({ inSidePanel = false }: { inSidePanel?: boolean }) {
       approvalResolveRef.current = null;
       agentAbortRef.current = null;
       setAgentApproval(null);
+      setNavApproval(null);
       agentRunningRef.current = false;
       setAgentRunning(false);
       setAgentProgress('');
@@ -1455,7 +1535,8 @@ function App({ inSidePanel = false }: { inSidePanel?: boolean }) {
         <p id="run-form-task-help">
           Run Agent works toward this goal in the current tab. It can fill in
           form fields and follow links within the same website (up to 2
-          pages). It never clicks buttons, submits forms, or leaves the site.
+          pages). It asks you before opening a link to a different website.
+          It never clicks buttons or submits forms.
         </p>
 
         {agentRunning && (
@@ -1488,6 +1569,42 @@ function App({ inSidePanel = false }: { inSidePanel?: boolean }) {
                 ))}
               </ol>
             </>
+          )}
+
+          {navApproval && (
+            <div role="group" aria-labelledby="leave-site-heading">
+              <h3 id="leave-site-heading">Leave this website?</h3>
+              <p>
+                The agent wants to open a link on a different website. This
+                only allows this one link, not other websites.
+              </p>
+
+              <p>
+                <strong>Link:</strong> {navApproval.label}
+              </p>
+
+              <p style={{ overflowWrap: 'anywhere' }}>
+                <strong>Destination:</strong> {navApproval.url}
+              </p>
+
+              <p style={{ overflowWrap: 'anywhere' }}>
+                <strong>Website:</strong> {navApproval.origin}
+              </p>
+
+              <button
+                type="button"
+                onClick={() => approvalResolveRef.current?.(true)}
+              >
+                Allow Navigation
+              </button>
+
+              <button
+                type="button"
+                onClick={() => approvalResolveRef.current?.(false)}
+              >
+                Cancel
+              </button>
+            </div>
           )}
 
           {agentApproval && (

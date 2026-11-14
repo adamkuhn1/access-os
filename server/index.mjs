@@ -128,7 +128,9 @@ Rules:
 - Use only element IDs from the provided controls.
 - History can include steps from earlier pages (a "click" step's value is the page it opened). Element IDs are only valid for the current page.
 - Look at the history and the current checked/selected state. Never repeat a step that already succeeded. If something already has the requested state, move on.
-- For questions or "find/compare/which/what" goals, assume they're about the page the user is on and choose "analyze" first, even if the page also has search fields. Only fill in a search form if the user gave the values to search for. Don't use "ask" or "none" for information goals just because you can't see the page text; that's what "analyze" is for.
+- For questions or "find/compare/which/what/cheapest" goals, assume the answer may already be shown on the page the user is on and choose "analyze" first, even if the page also has search fields. Only fill in a search form if the user gave the values to search for. Don't use "ask" or "none" for information goals just because you can't see the page text; that's what "analyze" is for.
+  Example: goal "Find the cheapest nonstop flight" on a page whose only control is a "From" field -> {"action":"analyze",...}, not a question about cities.
+- Use "ask" only when the goal tells you to fill in or change something and a value it needs is missing.
 - Only do what the user's goal asks for. Never fill in fields the goal doesn't mention.
 - Never invent personal information. Use values the user explicitly gave; otherwise use "ask".
 - Never submit forms, press submit/buy/pay/delete buttons, or follow links that sign up, purchase, delete, or otherwise commit the user to something. If the goal asks for one of these, do everything else first, then return "none" and say which step the user has to do themselves. Only return "done" when nothing in the goal is left undone.

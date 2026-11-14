@@ -8,11 +8,20 @@ const [linkText, setLinkText] = useState('Learn more');
   
 
   
+
 async function handleTest() {
-  setStatus('Connecting...');
+  setStatus('Scanning webpage...');
 
   try {
-    //find the currently active browser tab
+    // Get the user's command
+    const command = linkText.trim();
+
+    if (!command) {
+      setStatus('Please enter a command.');
+      return;
+    }
+
+    // Find the active browser tab
     const [tab] = await browser.tabs.query({
       active: true,
       currentWindow: true,
@@ -22,31 +31,54 @@ async function handleTest() {
       throw new Error('No active tab found');
     }
 
-    //send a command to our content script
-    
+    // Ask the content script to scan the page
+    const pageData = await browser.tabs.sendMessage(tab.id, {
+      type: 'GET_PAGE_ELEMENTS',
+    });
 
-const targetText = linkText
-  .trim()
-  .replace(/^(click|open)\s+(the\s+)?/i, '')
-  .replace(/\s+link$/i, '');
+    setStatus('Asking Claude...');
 
-const response = await browser.tabs.sendMessage(tab.id, {
-  type: 'CLICK_LINK',
-  text: targetText,
-});
+    // Send the real page elements and command to our backend
+    const response = await fetch('http://127.0.0.1:3001/interpret', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        command,
+        elements: pageData.elements,
+      }),
+    });
 
+    if (!response.ok) {
+      throw new Error(`Backend error: ${response.status}`);
+    }
 
-if (response.success) {
-  setStatus('Opening link...');
-} else {
-  setStatus('Link not found');
-}
+    const result = await response.json();
+
+    // Display Claude's decision
+    if (result.action === 'none') {
+      setStatus('Claude could not find a matching element.');
+      return;
+    }
+
+    const selected = pageData.elements.find(
+      (element: { id: number; text: string; role: string }) =>
+        element.id === result.elementId
+    );
+
+    if (!selected) {
+      throw new Error('Claude selected an invalid element');
+    }
+
+    setStatus(`Claude selected: ${selected.text} (${selected.role})`);
 
   } catch (error) {
     console.error(error);
-    setStatus('Connection failed');
+    setStatus('Error connecting to Claude. Check console.');
   }
 }
+
 
 
   return (
@@ -62,7 +94,7 @@ if (response.success) {
 />
 
       <button onClick={handleTest}>
-  Open Link
+  Ask Claude
 </button>
 
       <p>Status: {status}</p>

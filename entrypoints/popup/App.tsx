@@ -31,6 +31,13 @@ type PendingFormControl = {
   tabId: number;
 };
 
+type AgentPreview = {
+  action: string;
+  target?: string;
+  value?: string;
+  message: string;
+};
+
 type SpeechResultEvent = {
   resultIndex: number;
   results: ArrayLike<{
@@ -64,6 +71,11 @@ function App({ inSidePanel = false }: { inSidePanel?: boolean }) {
   const voiceActiveRef = useRef(false);
   const recognitionRef = useRef<SpeechRecognizer | null>(null);
   const permissionWatchRef = useRef<PermissionStatus | null>(null);
+
+  const [agentGoal, setAgentGoal] = useState('');
+  const [agentLoading, setAgentLoading] = useState(false);
+  const [agentPreview, setAgentPreview] =
+    useState<AgentPreview | null>(null);
 
   // recognition callbacks would otherwise see stale state
   const latestActionsRef = useRef({
@@ -567,6 +579,90 @@ function App({ inSidePanel = false }: { inSidePanel?: boolean }) {
     }
   }
 
+  // preview only for now - shows what the agent would do, never runs it
+  async function handlePreviewNextStep() {
+    if (agentLoading) return;
+
+    if (!agentGoal.trim()) {
+      setAgentPreview({
+        action: 'error',
+        message: 'Please enter a goal first.',
+      });
+      return;
+    }
+
+    setAgentLoading(true);
+    setAgentPreview(null);
+
+    try {
+      const [tab] = await browser.tabs.query({
+        active: true,
+        currentWindow: true,
+      });
+
+      if (!tab?.id) {
+        throw new Error('No active tab found');
+      }
+
+      const pageData = await browser.tabs.sendMessage(tab.id, {
+        type: 'GET_PAGE_ELEMENTS',
+      });
+
+      const elements = pageData.elements as PageElement[];
+
+      const response = await fetch(
+        'http://127.0.0.1:3001/agent/next',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            goal: agentGoal.trim(),
+            url: tab.url ?? '',
+            elements,
+            history: [],
+          }),
+        }
+      );
+
+      const result = await response.json();
+
+      if (!response.ok) {
+        throw new Error(result.error || `Backend error: ${response.status}`);
+      }
+
+      const target = elements.find(
+        (element) => element.id === result.elementId
+      );
+
+      let value: string | undefined;
+
+      if (typeof result.value === 'boolean') {
+        value = result.value ? 'Check / select' : 'Uncheck';
+      } else if (typeof result.value === 'string') {
+        value = result.value;
+      }
+
+      setAgentPreview({
+        action: result.action,
+        target: target?.text,
+        value,
+        message: result.message || '',
+      });
+    } catch (error) {
+      console.error(error);
+
+      setAgentPreview({
+        action: 'error',
+        message:
+          error instanceof Error
+            ? error.message
+            : 'Could not preview the next step.',
+      });
+    } finally {
+      setAgentLoading(false);
+    }
+  }
+
   async function handleOpenSidePanel() {
     try {
       const currentWindow = await browser.windows.getCurrent();
@@ -691,6 +787,68 @@ function App({ inSidePanel = false }: { inSidePanel?: boolean }) {
           </button>
         </div>
       )}
+
+      <section aria-labelledby="agent-mode-heading">
+        <h2 id="agent-mode-heading">Agent Mode</h2>
+
+        <input
+          type="text"
+          value={agentGoal}
+          placeholder="Describe your overall goal"
+          aria-label="Agent goal"
+          onChange={(e) => setAgentGoal(e.target.value)}
+        />
+
+        <button
+          type="button"
+          onClick={() => void handlePreviewNextStep()}
+          disabled={agentLoading}
+        >
+          {agentLoading ? 'Thinking...' : 'Preview Next Step'}
+        </button>
+
+        <div aria-live="polite">
+          {agentPreview?.action === 'error' && (
+            <p>Error: {agentPreview.message}</p>
+          )}
+
+          {agentPreview && agentPreview.action !== 'error' && (
+            <div>
+              <h3>
+                {agentPreview.action === 'done' && 'All done'}
+                {agentPreview.action === 'ask' && 'Claude needs more info'}
+                {agentPreview.action === 'none' && 'Nothing to do here'}
+                {['set', 'click'].includes(agentPreview.action) &&
+                  'Proposed next step (preview only)'}
+              </h3>
+
+              {['set', 'click'].includes(agentPreview.action) && (
+                <>
+                  <p>
+                    <strong>Action:</strong>{' '}
+                    {agentPreview.action === 'set'
+                      ? 'Change form field'
+                      : 'Open link'}
+                  </p>
+
+                  <p>
+                    <strong>Target:</strong>{' '}
+                    {agentPreview.target ?? 'Unknown element'}
+                  </p>
+
+                  {agentPreview.value !== undefined && (
+                    <p style={{ overflowWrap: 'anywhere' }}>
+                      <strong>Value:</strong> {agentPreview.value}
+                    </p>
+                  )}
+                </>
+              )}
+
+              {agentPreview.message && <p>{agentPreview.message}</p>}
+            </div>
+          )}
+        </div>
+      </section>
     </main>
   );
 }

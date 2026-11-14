@@ -7,13 +7,12 @@ export default defineContentScript({
   main() {
     console.log('Access OS is running!');
 
-    // Store webpage elements by their assigned IDs
     const elementById = new Map<number, HTMLElement>();
 
     browser.runtime.onMessage.addListener(
       (message, _sender, sendResponse) => {
 
-        // 1. Highlight all links (original test)
+        // old test - highlights every link
         if (message.type === 'HIGHLIGHT_LINKS') {
           document
             .querySelectorAll<HTMLAnchorElement>('a[href]')
@@ -25,7 +24,6 @@ export default defineContentScript({
           return;
         }
 
-        // 2. Scan interactive webpage elements
         if (message.type === 'GET_PAGE_ELEMENTS') {
 
           const links = Array.from(
@@ -138,7 +136,6 @@ export default defineContentScript({
           return;
         }
 
-        // 3. Highlight a selected element
         if (
           message.type === 'HIGHLIGHT_ELEMENT' &&
           typeof message.elementId === 'number'
@@ -164,7 +161,6 @@ export default defineContentScript({
           return;
         }
 
-        // 4. Open an approved link
         if (
           message.type === 'CLICK_SELECTED_LINK' &&
           typeof message.elementId === 'number'
@@ -227,7 +223,7 @@ export default defineContentScript({
           return;
         }
 
-        // 5. Original text filling (temporary compatibility)
+        // old text-only fill, keeping it around for now
         if (
           message.type === 'FILL_TEXT_INPUT' &&
           typeof message.elementId === 'number' &&
@@ -288,7 +284,7 @@ export default defineContentScript({
           return;
         }
 
-        // 6. UNIVERSAL FORM ENGINE
+        // handles text fields, checkboxes, radios and selects
         if (message.type === 'SET_FORM_CONTROL') {
           const elementId = message.elementId;
           const value = message.value;
@@ -314,7 +310,7 @@ export default defineContentScript({
             return;
           }
 
-          // A. Checkboxes and radio buttons
+          // checkbox / radio
           if (
             target instanceof HTMLInputElement &&
             ['checkbox', 'radio'].includes(target.type)
@@ -346,7 +342,7 @@ export default defineContentScript({
             return;
           }
 
-          // B. Text inputs and textareas
+          // text inputs + textareas
           if (
             target instanceof HTMLInputElement ||
             target instanceof HTMLTextAreaElement
@@ -423,7 +419,7 @@ export default defineContentScript({
             return;
           }
 
-          // C. Dropdown menus
+          // selects
           if (target instanceof HTMLSelectElement) {
             if (
               target.disabled ||

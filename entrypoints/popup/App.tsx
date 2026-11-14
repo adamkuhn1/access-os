@@ -50,7 +50,7 @@ type SpeechRecognizer = {
   stop: () => void;
 };
 
-function App() {
+function App({ inSidePanel = false }: { inSidePanel?: boolean }) {
   const [status, setStatus] = useState('Ready');
   const [command, setCommand] = useState('');
   const [listening, setListening] = useState(false);
@@ -61,11 +61,11 @@ function App() {
   const [pendingForm, setPendingForm] =
     useState<PendingFormControl | null>(null);
 
-  // Voice mode references
   const voiceActiveRef = useRef(false);
   const recognitionRef = useRef<SpeechRecognizer | null>(null);
+  const permissionWatchRef = useRef<PermissionStatus | null>(null);
 
-  // Keep the latest proposed actions available to voice mode
+  // recognition callbacks would otherwise see stale state
   const latestActionsRef = useRef({
     pendingForm,
     selectedLink,
@@ -82,18 +82,18 @@ function App() {
     };
   });
 
-  // Clean up the microphone if the popup closes
+  // make sure the mic gets released when the UI closes
   useEffect(() => {
     return () => {
       voiceActiveRef.current = false;
       recognitionRef.current?.stop();
       recognitionRef.current = null;
+
+      if (permissionWatchRef.current) {
+        permissionWatchRef.current.onchange = null;
+      }
     };
   }, []);
-
-  // --------------------------------------------------
-  // 1. ASK CLAUDE
-  // --------------------------------------------------
 
   async function handleAskClaude(inputCommand = command) {
     setSelectedLink(null);
@@ -171,7 +171,6 @@ function App() {
         return;
       }
 
-      // Navigation
       if (result.action === 'click') {
         if (
           selected.role !== 'link' ||
@@ -192,7 +191,6 @@ function App() {
         return;
       }
 
-      // Universal Form Engine
       if (result.action === 'set') {
         if (
           !['input', 'textarea', 'select'].includes(
@@ -245,10 +243,6 @@ function App() {
     }
   }
 
-  // --------------------------------------------------
-  // 2. CONFIRM NAVIGATION
-  // --------------------------------------------------
-
   async function handleConfirmNavigation() {
     if (!selectedLink) return;
 
@@ -289,10 +283,6 @@ function App() {
       setSelectedLink(null);
     }
   }
-
-  // --------------------------------------------------
-  // 3. CONFIRM FORM CHANGE
-  // --------------------------------------------------
 
   async function handleConfirmForm() {
     if (!pendingForm) return;
@@ -335,10 +325,6 @@ function App() {
     }
   }
 
-  // --------------------------------------------------
-  // 4. STOP VOICE MODE
-  // --------------------------------------------------
-
   function stopVoice() {
     voiceActiveRef.current = false;
 
@@ -349,17 +335,86 @@ function App() {
     setStatus('Voice mode off.');
   }
 
-  // --------------------------------------------------
-  // 5. CONTINUOUS VOICE MODE
-  // --------------------------------------------------
-
-  function handleVoice() {
-    // Toggle voice mode off
+  async function handleVoice() {
     if (voiceActiveRef.current) {
       stopVoice();
       return;
     }
 
+    let permission: PermissionStatus;
+
+    try {
+      permission = await navigator.permissions.query({
+        name: 'microphone' as PermissionName,
+      });
+    } catch (error) {
+      // no permissions API, just try it
+      console.error(error);
+      startListening();
+      return;
+    }
+
+    if (permission.state === 'granted') {
+      startListening();
+      return;
+    }
+
+    if (permission.state === 'denied') {
+      setStatus(
+        'Microphone is blocked for Access OS. Open the setup tab, click the icon left of the address bar, set Microphone to Allow, then press Start Listening again.'
+      );
+      return;
+    }
+
+    // chrome won't show the mic prompt in a popup/side panel, so it has to
+    // happen in a normal tab
+    setStatus(
+      'Microphone permission is needed. Click "Enable Microphone" in the setup tab that just opened.'
+    );
+
+    if (permissionWatchRef.current) {
+      permissionWatchRef.current.onchange = null;
+    }
+    permissionWatchRef.current = permission;
+
+    permission.onchange = () => {
+      if (permission.state === 'granted') {
+        permission.onchange = null;
+        permissionWatchRef.current = null;
+        startListening();
+      } else if (permission.state === 'denied') {
+        permission.onchange = null;
+        permissionWatchRef.current = null;
+        setStatus(
+          'Microphone access was blocked. Voice mode needs it, but typed commands still work.'
+        );
+      }
+    };
+
+    try {
+      const setupUrl = browser.runtime.getURL('/mic-permission.html');
+
+      // don't open a second setup tab if one is already open
+      const [existing] = await browser.runtime.getContexts({
+        contextTypes: [browser.runtime.ContextType.TAB],
+        documentUrls: [setupUrl],
+      });
+
+      if (existing && existing.tabId !== -1) {
+        await browser.tabs.update(existing.tabId, { active: true });
+        await browser.windows.update(existing.windowId, {
+          focused: true,
+        });
+      } else {
+        await browser.tabs.create({ url: setupUrl });
+      }
+    } catch (error) {
+      console.error(error);
+      setStatus('Could not open the microphone setup page.');
+    }
+  }
+
+  function startListening() {
     const speechWindow = window as Window & {
       SpeechRecognition?: new () => SpeechRecognizer;
       webkitSpeechRecognition?: new () => SpeechRecognizer;
@@ -380,7 +435,6 @@ function App() {
     recognition.continuous = true;
     recognition.interimResults = false;
 
-    // Process each completed spoken phrase
     recognition.onresult = (event) => {
       for (
         let i = event.resultIndex;
@@ -403,7 +457,6 @@ function App() {
 
         console.log('Voice command:', transcript);
 
-        // Stop listening by voice
         if (
           [
             'stop listening',
@@ -415,7 +468,6 @@ function App() {
           return;
         }
 
-        // Confirm a proposed action
         if (
           ['confirm', 'yes', 'go ahead'].includes(spoken)
         ) {
@@ -430,7 +482,6 @@ function App() {
           continue;
         }
 
-        // Cancel a proposed action
         if (
           ['cancel', 'no', 'stop'].includes(spoken)
         ) {
@@ -440,7 +491,6 @@ function App() {
           continue;
         }
 
-        // Otherwise, send a new command to Claude
         setCommand(transcript);
         setSelectedLink(null);
         setPendingForm(null);
@@ -452,18 +502,33 @@ function App() {
     recognition.onerror = (event) => {
       if (!voiceActiveRef.current) return;
 
-      // Chrome may report silence in continuous mode.
+      // chrome fires no-speech a lot in continuous mode
       if (event.error === 'no-speech') return;
 
       voiceActiveRef.current = false;
       recognitionRef.current = null;
 
       setListening(false);
-      setStatus(`Microphone error: ${event.error}`);
+
+      if (event.error === 'not-allowed') {
+        setStatus(
+          'Microphone permission denied. Press Start Listening to set it up.'
+        );
+      } else if (event.error === 'audio-capture') {
+        setStatus('No microphone was found. Check your audio input.');
+      } else if (event.error === 'service-not-allowed') {
+        setStatus('Chrome speech recognition service is unavailable.');
+      } else if (event.error === 'network') {
+        setStatus(
+          'Speech recognition network error. Check your connection.'
+        );
+      } else {
+        setStatus(`Speech recognition error: ${event.error}`);
+      }
     };
 
     recognition.onend = () => {
-      // Automatically restart if voice mode is still enabled
+      // chrome ends recognition on its own sometimes, so restart it
       if (voiceActiveRef.current) {
         try {
           recognition.start();
@@ -502,9 +567,22 @@ function App() {
     }
   }
 
-  // --------------------------------------------------
-  // 6. USER INTERFACE
-  // --------------------------------------------------
+  async function handleOpenSidePanel() {
+    try {
+      const currentWindow = await browser.windows.getCurrent();
+
+      if (currentWindow.id === undefined) {
+        setStatus('Could not find the current window.');
+        return;
+      }
+
+      await browser.sidePanel.open({ windowId: currentWindow.id });
+      setStatus('Side panel opened.');
+    } catch (error) {
+      console.error(error);
+      setStatus('Could not open side panel.');
+    }
+  }
 
   return (
     <main>
@@ -525,7 +603,7 @@ function App() {
 
       <button
         type="button"
-        onClick={handleVoice}
+        onClick={() => void handleVoice()}
         aria-pressed={listening}
       >
         {listening
@@ -540,9 +618,17 @@ function App() {
         Ask Claude
       </button>
 
+      {!inSidePanel && (
+        <button
+          type="button"
+          onClick={() => void handleOpenSidePanel()}
+        >
+          Open Side Panel
+        </button>
+      )}
+
       <p role="status">Status: {status}</p>
 
-      {/* Navigation confirmation */}
       {selectedLink && (
         <div>
           <h3>Proposed Navigation</h3>
@@ -574,7 +660,6 @@ function App() {
         </div>
       )}
 
-      {/* Universal form confirmation */}
       {pendingForm && (
         <div>
           <h3>Proposed Form Change</h3>

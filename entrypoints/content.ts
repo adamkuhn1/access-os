@@ -7,42 +7,27 @@ export default defineContentScript({
   main() {
     console.log('Access OS is running!');
 
-    // Find interactive elements on the webpage
-    const buttons = document.querySelectorAll('button');
-    const links = document.querySelectorAll<HTMLAnchorElement>('a[href]');
-    const inputs = document.querySelectorAll('input');
-
-    console.log('Buttons found:', buttons.length);
-    console.log('Links found:', links.length);
-    console.log('Inputs found:', inputs.length);
-
-    // Log information about links
-    links.forEach((link) => {
-      console.log('Link text:', link.textContent?.trim());
-      console.log('Link URL:', link.href);
-    });
-
-    // Store actual HTML elements by their assigned IDs
+    // Store webpage elements by their assigned IDs
     const elementById = new Map<number, HTMLElement>();
 
-    // Listen for commands from the Access OS popup
     browser.runtime.onMessage.addListener(
       (message, _sender, sendResponse) => {
 
-        // 1. Highlight all links (original test feature)
+        // 1. Highlight all links (original test)
         if (message.type === 'HIGHLIGHT_LINKS') {
-          links.forEach((link) => {
-            link.style.outline = '3px solid #14b8a6';
-          });
+          document
+            .querySelectorAll<HTMLAnchorElement>('a[href]')
+            .forEach((link) => {
+              link.style.outline = '3px solid #14b8a6';
+            });
 
           sendResponse({ success: true });
           return;
         }
 
-        // 2. Scan the webpage for interactive elements
+        // 2. Scan interactive webpage elements
         if (message.type === 'GET_PAGE_ELEMENTS') {
 
-          // Find links
           const links = Array.from(
             document.querySelectorAll<HTMLAnchorElement>('a[href]')
           ).map((link) => ({
@@ -54,7 +39,6 @@ export default defineContentScript({
             href: link.href,
           }));
 
-          // Find buttons
           const buttons = Array.from(
             document.querySelectorAll<HTMLButtonElement>('button')
           ).map((button) => ({
@@ -65,64 +49,114 @@ export default defineContentScript({
             role: 'button',
           }));
 
-          // Find input fields (excluding passwords and hidden inputs)
           const inputs = Array.from(
             document.querySelectorAll<HTMLInputElement>(
-              'input:not([type="hidden"]):not([type="password"])'
+              'input:not([type="hidden"]):not([type="password"]):not([type="file"]):not([type="submit"]):not([type="reset"]):not([type="button"]):not([type="image"])'
             )
-          ).map((input) => ({
-            element: input,
-            text:
+          ).map((input) => {
+            const isChoice = ['checkbox', 'radio'].includes(
+              input.type
+            );
+
+            const label =
               input.getAttribute('aria-label') ||
               input.labels?.[0]?.textContent?.trim() ||
+              (isChoice
+                ? input.nextSibling?.textContent?.trim()
+                : undefined) ||
               input.placeholder ||
               input.name ||
-              input.id,
-            role: 'input',
-            inputType: input.type,
+              input.id;
+
+            return {
+              element: input,
+              text: isChoice
+                ? `${input.name || input.type}: ${label}`
+                : label,
+              role: 'input',
+              inputType: input.type,
+              choiceValue: isChoice ? input.value : undefined,
+              checked: isChoice ? input.checked : undefined,
+            };
+          });
+
+          const textareas = Array.from(
+            document.querySelectorAll<HTMLTextAreaElement>(
+              'textarea'
+            )
+          ).map((textarea) => ({
+            element: textarea,
+            text:
+              textarea.getAttribute('aria-label') ||
+              textarea.labels?.[0]?.textContent?.trim() ||
+              textarea.placeholder ||
+              textarea.name ||
+              textarea.id,
+            role: 'textarea',
           }));
 
-          // Reset stored elements before a new scan
+          const selects = Array.from(
+            document.querySelectorAll<HTMLSelectElement>(
+              'select'
+            )
+          ).map((select) => ({
+            element: select,
+            text:
+              select.getAttribute('aria-label') ||
+              select.labels?.[0]?.textContent?.trim() ||
+              select.name ||
+              select.id,
+            role: 'select',
+            options: Array.from(select.options).map(
+              (option) => ({
+                text: option.text.trim(),
+                value: option.value,
+                disabled: option.disabled,
+              })
+            ),
+          }));
+
           elementById.clear();
 
-          // Combine elements and assign unique IDs
-          const elements = [...links, ...buttons, ...inputs]
+          const elements = [
+            ...links,
+            ...buttons,
+            ...inputs,
+            ...textareas,
+            ...selects,
+          ]
             .filter((item) => item.text)
-            .map(({ element, text, role, ...details }, index) => {
+            .map(({ element, ...data }, index) => {
               const id = index + 1;
-
-              // Store the real HTML element
               elementById.set(id, element);
 
-              // Send only descriptions to Claude
-              return { id, text, role, ...details };
+              return { id, ...data };
             });
 
           console.log('Scanned elements:', elements);
-
           sendResponse({ elements });
           return;
         }
 
-        // 3. Highlight an element selected by Claude
+        // 3. Highlight a selected element
         if (
           message.type === 'HIGHLIGHT_ELEMENT' &&
           typeof message.elementId === 'number'
         ) {
-          const target = elementById.get(message.elementId);
+          const target = elementById.get(
+            message.elementId
+          );
 
           if (!target || !target.isConnected) {
             sendResponse({ success: false });
             return;
           }
 
-          // Scroll the selected element into view
           target.scrollIntoView({
             behavior: 'smooth',
             block: 'center',
           });
 
-          // Add a teal outline
           target.style.outline = '4px solid #14b8a6';
           target.style.outlineOffset = '3px';
 
@@ -130,14 +164,15 @@ export default defineContentScript({
           return;
         }
 
-        // 4. Click an AI-selected link after confirmation
+        // 4. Open an approved link
         if (
           message.type === 'CLICK_SELECTED_LINK' &&
           typeof message.elementId === 'number'
         ) {
-          const target = elementById.get(message.elementId);
+          const target = elementById.get(
+            message.elementId
+          );
 
-          // Only allow valid links
           if (
             !(target instanceof HTMLAnchorElement) ||
             !target.isConnected
@@ -149,8 +184,9 @@ export default defineContentScript({
             return;
           }
 
-          // Only allow HTTP or HTTPS destinations
-          if (!['http:', 'https:'].includes(target.protocol)) {
+          if (
+            !['http:', 'https:'].includes(target.protocol)
+          ) {
             sendResponse({
               success: false,
               error: 'Unsupported URL',
@@ -158,7 +194,6 @@ export default defineContentScript({
             return;
           }
 
-          // Require confirmation from the popup
           if (message.confirmed !== true) {
             sendResponse({
               success: false,
@@ -167,7 +202,6 @@ export default defineContentScript({
             return;
           }
 
-          // Verify that the destination hasn't changed
           if (
             typeof message.expectedHref !== 'string' ||
             target.href !== message.expectedHref
@@ -179,7 +213,6 @@ export default defineContentScript({
             return;
           }
 
-          // Respond before the page navigates
           sendResponse({ success: true });
 
           setTimeout(() => {
@@ -194,15 +227,16 @@ export default defineContentScript({
           return;
         }
 
-        // 5. Fill a text field
+        // 5. Original text filling (temporary compatibility)
         if (
           message.type === 'FILL_TEXT_INPUT' &&
           typeof message.elementId === 'number' &&
           typeof message.value === 'string'
         ) {
-          const target = elementById.get(message.elementId);
+          const target = elementById.get(
+            message.elementId
+          );
 
-          // Only allow editable text inputs
           if (
             !(target instanceof HTMLInputElement) ||
             target.type !== 'text' ||
@@ -217,18 +251,20 @@ export default defineContentScript({
             });
             return;
           }
-if (message.confirmed !== true) {
-  sendResponse({
-    success: false,
-    error: 'Confirmation required',
-  });
-  return;
-}
-          // Get the browser's native value setter
-          const setter = Object.getOwnPropertyDescriptor(
-            HTMLInputElement.prototype,
-            'value'
-          )?.set;
+
+          if (message.confirmed !== true) {
+            sendResponse({
+              success: false,
+              error: 'Confirmation required',
+            });
+            return;
+          }
+
+          const setter =
+            Object.getOwnPropertyDescriptor(
+              HTMLInputElement.prototype,
+              'value'
+            )?.set;
 
           if (!setter) {
             sendResponse({
@@ -238,10 +274,8 @@ if (message.confirmed !== true) {
             return;
           }
 
-          // Insert the text into the field
           setter.call(target, message.value);
 
-          // Notify the webpage of the change
           target.dispatchEvent(
             new Event('input', { bubbles: true })
           );
@@ -251,6 +285,218 @@ if (message.confirmed !== true) {
           );
 
           sendResponse({ success: true });
+          return;
+        }
+
+        // 6. UNIVERSAL FORM ENGINE
+        if (message.type === 'SET_FORM_CONTROL') {
+          const elementId = message.elementId;
+          const value = message.value;
+
+          if (
+            message.confirmed !== true ||
+            !Number.isInteger(elementId)
+          ) {
+            sendResponse({
+              success: false,
+              error: 'Invalid or unconfirmed action',
+            });
+            return;
+          }
+
+          const target = elementById.get(elementId);
+
+          if (!target || !target.isConnected) {
+            sendResponse({
+              success: false,
+              error: 'Element no longer exists',
+            });
+            return;
+          }
+
+          // A. Checkboxes and radio buttons
+          if (
+            target instanceof HTMLInputElement &&
+            ['checkbox', 'radio'].includes(target.type)
+          ) {
+            if (
+              target.disabled ||
+              typeof value !== 'boolean' ||
+              (target.type === 'radio' && value !== true)
+            ) {
+              sendResponse({
+                success: false,
+                error: 'Invalid selection',
+              });
+              return;
+            }
+
+            if (target.checked !== value) {
+              target.click();
+            }
+
+            const success = target.checked === value;
+
+            sendResponse({
+              success,
+              error: success
+                ? undefined
+                : 'Selection failed',
+            });
+            return;
+          }
+
+          // B. Text inputs and textareas
+          if (
+            target instanceof HTMLInputElement ||
+            target instanceof HTMLTextAreaElement
+          ) {
+            const isInput =
+              target instanceof HTMLInputElement;
+
+            const allowedTypes = [
+              'text',
+              'email',
+              'tel',
+              'url',
+              'search',
+              'number',
+              'date',
+              'time',
+              'datetime-local',
+              'month',
+              'week',
+            ];
+
+            if (
+              (isInput &&
+                !allowedTypes.includes(target.type)) ||
+              target.disabled ||
+              target.readOnly ||
+              typeof value !== 'string' ||
+              value.length > 1000
+            ) {
+              sendResponse({
+                success: false,
+                error: 'Invalid text field',
+              });
+              return;
+            }
+
+            const prototype = isInput
+              ? HTMLInputElement.prototype
+              : HTMLTextAreaElement.prototype;
+
+            const setter =
+              Object.getOwnPropertyDescriptor(
+                prototype,
+                'value'
+              )?.set;
+
+            if (!setter) {
+              sendResponse({
+                success: false,
+                error: 'Cannot update field',
+              });
+              return;
+            }
+
+            setter.call(target, value);
+
+            if (target.value !== value) {
+              sendResponse({
+                success: false,
+                error: 'Invalid field value',
+              });
+              return;
+            }
+
+            target.dispatchEvent(
+              new Event('input', { bubbles: true })
+            );
+
+            target.dispatchEvent(
+              new Event('change', { bubbles: true })
+            );
+
+            sendResponse({ success: true });
+            return;
+          }
+
+          // C. Dropdown menus
+          if (target instanceof HTMLSelectElement) {
+            if (
+              target.disabled ||
+              target.multiple ||
+              typeof value !== 'string'
+            ) {
+              sendResponse({
+                success: false,
+                error: 'Invalid dropdown',
+              });
+              return;
+            }
+
+            const option = Array.from(
+              target.options
+            ).find(
+              (option) =>
+                !option.disabled &&
+                (
+                  option.value === value ||
+                  option.text.trim().toLowerCase() ===
+                    value.toLowerCase()
+                )
+            );
+
+            if (!option) {
+              sendResponse({
+                success: false,
+                error: 'Option not found',
+              });
+              return;
+            }
+
+            const setter =
+              Object.getOwnPropertyDescriptor(
+                HTMLSelectElement.prototype,
+                'value'
+              )?.set;
+
+            if (!setter) {
+              sendResponse({
+                success: false,
+                error: 'Cannot update dropdown',
+              });
+              return;
+            }
+
+            setter.call(target, option.value);
+
+            target.dispatchEvent(
+              new Event('input', { bubbles: true })
+            );
+
+            target.dispatchEvent(
+              new Event('change', { bubbles: true })
+            );
+
+            const success =
+              target.value === option.value;
+
+            sendResponse({
+              success,
+              error: success
+                ? undefined
+                : 'Dropdown update failed',
+            });
+            return;
+          }
+
+          sendResponse({
+            success: false,
+            error: 'Unsupported control',
+          });
           return;
         }
       }

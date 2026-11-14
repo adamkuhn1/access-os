@@ -8,6 +8,12 @@ type PageElement = {
   text: string;
   role: string;
   href?: string;
+  inputType?: string;
+  options?: {
+    text: string;
+    value: string;
+    disabled?: boolean;
+  }[];
 };
 
 type SelectedLink = {
@@ -15,37 +21,39 @@ type SelectedLink = {
   text: string;
   href: string;
   tabId: number;
-
 };
 
-type PendingFill = {
+type PendingFormControl = {
   id: number;
   text: string;
-  value: string;
+  value: string | boolean;
+  displayValue: string;
   tabId: number;
 };
 
 function App() {
   const [status, setStatus] = useState('Ready');
-  const [linkText, setLinkText] = useState('Learn more');
-  const [pendingFill, setPendingFill] = useState<PendingFill | null>(null);
+  const [command, setCommand] = useState('');
+
   const [selectedLink, setSelectedLink] =
     useState<SelectedLink | null>(null);
 
-  async function handleTest() {
-    setPendingFill(null);
-    setStatus('Scanning webpage...');
+  const [pendingForm, setPendingForm] =
+    useState<PendingFormControl | null>(null);
+
+  // Ask Claude to interpret a command
+  async function handleAskClaude() {
     setSelectedLink(null);
+    setPendingForm(null);
+
+    if (!command.trim()) {
+      setStatus('Please enter a command.');
+      return;
+    }
+
+    setStatus('Scanning webpage...');
 
     try {
-      const command = linkText.trim();
-
-      if (!command) {
-        setStatus('Please enter a command.');
-        return;
-      }
-
-      // Find the active browser tab
       const [tab] = await browser.tabs.query({
         active: true,
         currentWindow: true,
@@ -55,16 +63,17 @@ function App() {
         throw new Error('No active tab found');
       }
 
-      // Get real webpage elements
-      const pageData = await browser.tabs.sendMessage(tab.id, {
-        type: 'GET_PAGE_ELEMENTS',
-      });
+      // Scan the current webpage
+      const pageData = await browser.tabs.sendMessage(
+        tab.id,
+        { type: 'GET_PAGE_ELEMENTS' }
+      );
 
       const elements = pageData.elements as PageElement[];
 
       setStatus('Asking Claude...');
 
-      // Send command and elements to our AI backend
+      // Send the instruction to our AI backend
       const response = await fetch(
         'http://127.0.0.1:3001/interpret',
         {
@@ -73,7 +82,7 @@ function App() {
             'Content-Type': 'application/json',
           },
           body: JSON.stringify({
-            command,
+            command: command.trim(),
             elements,
           }),
         }
@@ -85,78 +94,104 @@ function App() {
 
       const result = await response.json();
 
-      // Handle no matching element
       if (result.action === 'none') {
-  setStatus('Claude could not find a matching element.');
-  return;
-}
+        setStatus('Claude could not complete that request.');
+        return;
+      }
 
-      // Find Claude's selected element
+      // Find the element Claude selected
       const selected = elements.find(
         (element) => element.id === result.elementId
       );
-      console.log('Claude selected element:', selected);
+
       if (!selected) {
-        throw new Error('Claude selected an invalid element');
+        throw new Error('Invalid element selected');
       }
 
-      // Highlight the selected element on the webpage
+      // Highlight the element on the webpage
       const highlightResult = await browser.tabs.sendMessage(
         tab.id,
         {
           type: 'HIGHLIGHT_ELEMENT',
-          elementId: result.elementId,
+          elementId: selected.id,
         }
       );
 
       if (!highlightResult.success) {
-        setStatus('Could not highlight the selected element.');
+        setStatus('Could not highlight the element.');
         return;
       }
 
+      // NAVIGATION ACTION
+      if (result.action === 'click') {
+        if (
+          selected.role !== 'link' ||
+          typeof selected.href !== 'string'
+        ) {
+          setStatus('Invalid navigation action.');
+          return;
+        }
 
-
-if (result.action === 'fill') {
-  if (
-    selected.role !== 'input' ||
-    typeof result.value !== 'string'
-  ) {
-    setStatus('Invalid text-entry action.');
-    return;
-  }
-
-  // Save Claude's proposed text entry
-  setPendingFill({
-    id: selected.id,
-    text: selected.text,
-    value: result.value,
-    tabId: tab.id,
-  });
-
-  setStatus(
-    `Claude wants to enter "${result.value}" in ${selected.text}`
-  );
-
-  return;
-}
-
-
-
-      setStatus(`Highlighted: ${selected.text}`);
-
-      // Save link information for user confirmation
-      if (
-        selected.role === 'link' &&
-        typeof selected.href === 'string'
-      ) {
         setSelectedLink({
           id: selected.id,
           text: selected.text,
           href: selected.href,
           tabId: tab.id,
-
         });
+
+        setStatus('Please confirm navigation.');
+        return;
       }
+
+      // UNIVERSAL FORM ACTION
+      if (result.action === 'set') {
+        if (
+          !['input', 'textarea', 'select'].includes(
+            selected.role
+          ) ||
+          !['string', 'boolean'].includes(
+            typeof result.value
+          )
+        ) {
+          setStatus('Invalid form action.');
+          return;
+        }
+
+        let displayValue = String(result.value);
+
+        // Make checkboxes and radio buttons readable
+        if (selected.inputType === 'checkbox') {
+          displayValue = result.value
+            ? 'Check'
+            : 'Uncheck';
+        } else if (selected.inputType === 'radio') {
+          displayValue = 'Select';
+        }
+
+        // Display dropdown option labels instead of IDs
+        if (selected.role === 'select') {
+          const option = selected.options?.find(
+            (item) => item.value === result.value
+          );
+
+          if (option) {
+            displayValue = option.text;
+          }
+        }
+
+        setPendingForm({
+          id: selected.id,
+          text: selected.text,
+          value: result.value,
+          displayValue,
+          tabId: tab.id,
+        });
+
+        setStatus('Please confirm the form change.');
+        return;
+      }
+
+      setStatus('Unsupported AI action.');
 
     } catch (error) {
       console.error(error);
@@ -164,95 +199,92 @@ if (result.action === 'fill') {
     }
   }
 
+  // Confirm and open a link
+  async function handleConfirmNavigation() {
+    if (!selectedLink) return;
 
-async function handleConfirm() {
-  if (!selectedLink) return;
+    setStatus('Opening link...');
 
-  setStatus('Opening link...');
+    try {
+      const [tab] = await browser.tabs.query({
+        active: true,
+        currentWindow: true,
+      });
 
-  try {
-    const [activeTab] = await browser.tabs.query({
-      active: true,
-      currentWindow: true,
-    });
-
-    if (activeTab?.id !== selectedLink.tabId) {
-      setStatus('Tab changed. Please ask Claude again.');
-      setSelectedLink(null);
-      return;
-    }
-
-    const response = await browser.tabs.sendMessage(
-      selectedLink.tabId,
-      {
-        type: 'CLICK_SELECTED_LINK',
-        elementId: selectedLink.id,
-        expectedHref: selectedLink.href,
-        confirmed: true,
+      if (tab?.id !== selectedLink.tabId) {
+        setStatus('Tab changed. Please try again.');
+        setSelectedLink(null);
+        return;
       }
-    );
 
-    if (response.success) {
-      setStatus('Link opened!');
+      const result = await browser.tabs.sendMessage(
+        selectedLink.tabId,
+        {
+          type: 'CLICK_SELECTED_LINK',
+          elementId: selectedLink.id,
+          expectedHref: selectedLink.href,
+          confirmed: true,
+        }
+      );
+
+      setStatus(
+        result.success
+          ? 'Link opened!'
+          : result.error || 'Navigation failed.'
+      );
+
       setSelectedLink(null);
-    } else {
-      setStatus(response.error || 'Could not open link.');
+
+    } catch (error) {
+      console.error(error);
+      setStatus('Navigation failed.');
       setSelectedLink(null);
     }
-  } catch (error) {
-    console.error(error);
-    setStatus('Navigation failed.');
-    setSelectedLink(null);
   }
-}
 
+  // Confirm and apply a form change
+  async function handleConfirmForm() {
+    if (!pendingForm) return;
 
+    setStatus('Updating form...');
 
+    try {
+      const [tab] = await browser.tabs.query({
+        active: true,
+        currentWindow: true,
+      });
 
-
-async function handleConfirmFill() {
-  if (!pendingFill) return;
-
-  setStatus('Filling field...');
-
-  try {
-    // Check that we're still on the correct tab
-    const [activeTab] = await browser.tabs.query({
-      active: true,
-      currentWindow: true,
-    });
-
-    if (activeTab?.id !== pendingFill.tabId) {
-      setStatus('Tab changed. Please ask Claude again.');
-      setPendingFill(null);
-      return;
-    }
-
-    // Send the approved text-entry action
-    const response = await browser.tabs.sendMessage(
-      pendingFill.tabId,
-      {
-        type: 'FILL_TEXT_INPUT',
-        elementId: pendingFill.id,
-        value: pendingFill.value,
-        confirmed: true,
+      if (tab?.id !== pendingForm.tabId) {
+        setStatus('Tab changed. Please try again.');
+        setPendingForm(null);
+        return;
       }
-    );
 
-    if (response.success) {
-      setStatus(`Filled: ${pendingFill.text}`);
-    } else {
-      setStatus(response.error || 'Could not fill field.');
+      // Universal Form Engine
+      const result = await browser.tabs.sendMessage(
+        pendingForm.tabId,
+        {
+          type: 'SET_FORM_CONTROL',
+          elementId: pendingForm.id,
+          value: pendingForm.value,
+          confirmed: true,
+        }
+      );
+
+      setStatus(
+        result.success
+          ? `Updated: ${pendingForm.text}`
+          : result.error || 'Form update failed.'
+      );
+
+      setPendingForm(null);
+
+    } catch (error) {
+      console.error(error);
+      setStatus('Form update failed.');
+      setPendingForm(null);
     }
-
-    setPendingFill(null);
-  } catch (error) {
-    console.error(error);
-    setStatus('Text entry failed.');
-    setPendingFill(null);
   }
-}
-
 
   return (
     <main>
@@ -261,45 +293,23 @@ async function handleConfirmFill() {
 
       <input
         type="text"
-        value={linkText}
-        onChange={(e) => {
-  setLinkText(e.target.value);
-  setSelectedLink(null);
-  setPendingFill(null);
-}}
+        value={command}
         placeholder="What would you like to do?"
         aria-label="Command"
+        onChange={(e) => {
+          setCommand(e.target.value);
+          setSelectedLink(null);
+          setPendingForm(null);
+        }}
       />
 
-      <button onClick={handleTest}>
+      <button type="button" onClick={handleAskClaude}>
         Ask Claude
       </button>
 
       <p role="status">Status: {status}</p>
 
-
-{pendingFill && (
-  <div>
-    <h3>Proposed Text Entry</h3>
-
-    <p><strong>Field:</strong> {pendingFill.text}</p>
-    <p><strong>Value:</strong> {pendingFill.value}</p>
-<button type="button" onClick={handleConfirmFill}>
-  Confirm & Fill
-</button>
-    <button
-      type="button"
-      onClick={() => {
-        setPendingFill(null);
-        setStatus('Text entry canceled.');
-      }}
-    >
-      Cancel
-    </button>
-  </div>
-)}
-
-
+      {/* Navigation confirmation */}
       {selectedLink && (
         <div>
           <h3>Proposed Navigation</h3>
@@ -312,24 +322,55 @@ async function handleConfirmFill() {
             <strong>Destination:</strong> {selectedLink.href}
           </p>
 
+          <button
+            type="button"
+            onClick={handleConfirmNavigation}
+          >
+            Confirm & Open
+          </button>
 
-<div style={{ display: 'flex', gap: '8px', justifyContent: 'center' }}>
-  <button type="button" onClick={handleConfirm}>
-  Confirm & Open
-</button>
+          <button
+            type="button"
+            onClick={() => {
+              setSelectedLink(null);
+              setStatus('Navigation canceled.');
+            }}
+          >
+            Cancel
+          </button>
+        </div>
+      )}
 
-  <button
-    type="button"
-    onClick={() => {
-      setSelectedLink(null);
-      setStatus('Navigation canceled.');
-    }}
-  >
-    Cancel
-  </button>
-</div>
+      {/* Universal form confirmation */}
+      {pendingForm && (
+        <div>
+          <h3>Proposed Form Change</h3>
 
+          <p>
+            <strong>Field:</strong> {pendingForm.text}
+          </p>
 
+          <p>
+            <strong>Action / Value:</strong>{' '}
+            {pendingForm.displayValue}
+          </p>
+
+          <button
+            type="button"
+            onClick={handleConfirmForm}
+          >
+            Confirm & Apply
+          </button>
+
+          <button
+            type="button"
+            onClick={() => {
+              setPendingForm(null);
+              setStatus('Form change canceled.');
+            }}
+          >
+            Cancel
+          </button>
         </div>
       )}
     </main>

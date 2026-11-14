@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>SkyCompare - Flight Results</title>
+    <style>
+      .card { border: 1px solid #ccc; padding: 8px; margin: 8px 0; }
+      .row { display: flex; gap: 12px; }
+      .hidden-promo { display: none; }
+      .invisible { visibility: hidden; }
+      .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+    </style>
+  </head>
+  <body>
+    <h1>Flights from Boston to Chicago</h1>
+    <p>Showing 3 results for Fri, Mar 6. Prices are per person, round trip.</p>
+
+    <form>
+      <label for="from">From</label>
+      <input id="from" value="FORM_VALUE_SHOULD_NOT_APPEAR" />
+      <label for="pw">Password</label>
+      <input id="pw" type="password" value="PASSWORD_SHOULD_NOT_APPEAR" />
+      <textarea>TEXTAREA_SHOULD_NOT_APPEAR</textarea>
+      <div contenteditable="true">EDITABLE_SHOULD_NOT_APPEAR</div>
+    </form>
+
+    <h2>Results</h2>
+
+    <div class="card">
+      <div class="row">
+        <span>Northwind Air</span>
+        <span>7:05 AM – 9:10 AM</span>
+        <span>BOS → ORD</span>
+        <span>Nonstop</span>
+        <strong>$189</strong>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="row">
+        <span>Bluebird Airlines</span>
+        <span>11:40 AM – 3:25 PM</span>
+        <span>BOS → MDW</span>
+        <span>1 stop (DTW)</span>
+        <strong>$142</strong>
+      </div>
+      <p class="hidden-promo">HIDDEN_PROMO_SHOULD_NOT_APPEAR</p>
+    </div>
+
+    <div class="card">
+      <div class="row">
+        <span>Polar Express Jet</span>
+        <span>6:15 PM – 8:05 PM</span>
+        <span>BOS → ORD</span>
+        <span>Nonstop</span>
+        <strong>$263</strong>
+      </div>
+      <span class="invisible">INVISIBLE_SHOULD_NOT_APPEAR</span>
+      <span style="opacity: 0">TRANSPARENT_SHOULD_NOT_APPEAR</span>
+    </div>
+
+    <h2>Schedule</h2>
+    <table>
+      <thead>
+        <tr><th>Airline</th><th>Departs</th><th>Price</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Northwind Air</td><td>7:05 AM</td><td>$189</td></tr>
+        <tr><td>Bluebird Airlines</td><td>11:40 AM</td><td>$142</td></tr>
+      </tbody>
+    </table>
+
+    <h2>Notes</h2>
+    <ul>
+      <li>Fares include taxes.</li>
+      <li>Baggage fees may apply.</li>
+    </ul>
+
+    <span class="sr-only">Screen reader note: prices update every 10 minutes.</span>
+
+    <script>window.SCRIPT_SHOULD_NOT_APPEAR = true;</script>
+  </body>
+</html>

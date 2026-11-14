@@ -155,6 +155,153 @@ export default defineContentScript({
       }, 1500);
     }
 
+    // read-only text extraction. walks visible text in DOM order and puts each
+    // block (div, p, li, heading...) on its own line, so text inside one
+    // result card stays together. table cells in a row are joined with " | "
+    function getPageContent() {
+      const MAX_CHARS = 10000;
+      const MAX_TEXT_NODES = 20000;
+
+      const skipSelector =
+        'script, style, noscript, template, svg, canvas, iframe, object, ' +
+        'input, textarea, select, option, [contenteditable=""], [contenteditable="true"]';
+
+      const visibleCache = new Map<Element, boolean>();
+      const blockCache = new Map<Element, Element>();
+
+      const isVisible = (element: Element) => {
+        let visible = visibleCache.get(element);
+
+        if (visible === undefined) {
+          visible = element.checkVisibility({
+            checkOpacity: true,
+            checkVisibilityCSS: true,
+          });
+          visibleCache.set(element, visible);
+        }
+
+        return visible;
+      };
+
+      // nearest ancestor that isn't inline, table cells count as their own block
+      const blockFor = (element: Element) => {
+        const cached = blockCache.get(element);
+        if (cached) return cached;
+
+        let node: Element = element;
+
+        while (node !== document.body && node.parentElement) {
+          if (node.matches('td, th')) break;
+
+          const display = getComputedStyle(node).display;
+          const parent: Element = node.parentElement;
+
+          // items in a small flex/grid row (like one result card) share a line
+          const parentDisplay = getComputedStyle(parent).display;
+          const inSmallRow =
+            /flex|grid/.test(parentDisplay) &&
+            (parent.textContent?.length ?? 0) <= 300;
+
+          if (
+            !display.startsWith('inline') &&
+            display !== 'contents' &&
+            !inSmallRow
+          ) {
+            break;
+          }
+
+          node = parent;
+        }
+
+        blockCache.set(element, node);
+        return node;
+      };
+
+      const prefixFor = (block: Element) => {
+        const heading = block.closest('h1, h2, h3, h4, h5, h6');
+        if (heading) return '#'.repeat(Number(heading.tagName[1])) + ' ';
+        if (block.closest('li')) return '- ';
+        return '';
+      };
+
+      const lines: string[] = [];
+      let length = 0;
+      let truncated = false;
+      let currentBlock: Element | null = null;
+      let currentLine = '';
+
+      const finishLine = () => {
+        const text = currentLine.replace(/\s+/g, ' ').trim();
+        currentLine = '';
+
+        if (!text || !currentBlock) return;
+
+        const line = prefixFor(currentBlock) + text;
+        if (line === lines[lines.length - 1]) return;
+
+        if (length + line.length > MAX_CHARS) {
+          truncated = true;
+          return;
+        }
+
+        lines.push(line);
+        length += line.length + 1;
+      };
+
+      const walker = document.createTreeWalker(
+        document.body,
+        NodeFilter.SHOW_TEXT
+      );
+
+      let visited = 0;
+
+      while (walker.nextNode()) {
+        if (truncated) break;
+
+        if (++visited > MAX_TEXT_NODES) {
+          truncated = true;
+          break;
+        }
+
+        const textNode = walker.currentNode as Text;
+        const parent = textNode.parentElement;
+        const text = textNode.data;
+
+        if (!parent || !text.trim()) continue;
+        if (cursor.contains(parent)) continue;
+        if (parent.closest(skipSelector)) continue;
+        if (!isVisible(parent)) continue;
+
+        const block = blockFor(parent);
+
+        if (block !== currentBlock) {
+          const sameRow =
+            currentBlock?.matches('td, th') &&
+            block.matches('td, th') &&
+            currentBlock.parentElement === block.parentElement;
+
+          if (sameRow) {
+            currentLine += ' | ';
+            currentBlock = block;
+          } else {
+            finishLine();
+            currentBlock = block;
+          }
+        }
+
+        currentLine += ' ' + text;
+      }
+
+      finishLine();
+
+      return {
+        title: document.title,
+        url: location.href,
+        content: lines.join('\n'),
+        truncated,
+      };
+    }
+
     browser.runtime.onMessage.addListener(
       (message, _sender, sendResponse) => {
 
@@ -645,6 +792,12 @@ export default defineContentScript({
             success: false,
             error: 'Unsupported control',
           });
+          return;
+        }
+
+        // page text is untrusted data. nothing sends it to the backend yet
+        if (message.type === 'GET_PAGE_CONTENT') {
+          sendResponse(getPageContent());
           return;
         }
 

@@ -95,6 +95,16 @@ function App({ inSidePanel = false }: { inSidePanel?: boolean }) {
   const recognitionRef = useRef<SpeechRecognizer | null>(null);
   const permissionWatchRef = useRef<PermissionStatus | null>(null);
 
+  const [pageQuestion, setPageQuestion] = useState('');
+  const [analyzing, setAnalyzing] = useState(false);
+  const [pageText, setPageText] = useState('');
+  const [pageAnswer, setPageAnswer] = useState<{
+    answer: string;
+    evidence: string[];
+    truncated: boolean;
+  } | null>(null);
+  const [pageError, setPageError] = useState('');
+
   const [agentGoal, setAgentGoal] = useState('');
   const [agentLoading, setAgentLoading] = useState(false);
   const [agentPreview, setAgentPreview] =
@@ -606,6 +616,72 @@ function App({ inSidePanel = false }: { inSidePanel?: boolean }) {
 
       setListening(false);
       setStatus('Could not start microphone.');
+    }
+  }
+
+  // read-only: reads the page text and asks Claude about it, never acts on the page
+  async function handleAnalyzePage() {
+    if (analyzing) return;
+
+    if (!pageQuestion.trim()) {
+      setPageError('Please enter a question first.');
+      return;
+    }
+
+    setAnalyzing(true);
+    setPageError('');
+    setPageAnswer(null);
+    setPageText('');
+
+    try {
+      const [tab] = await browser.tabs.query({
+        active: true,
+        currentWindow: true,
+      });
+
+      if (!tab?.id || !tab.url || !/^https?:\/\//i.test(tab.url)) {
+        throw new Error('Page analysis only works on normal web pages.');
+      }
+
+      const page = await browser.tabs.sendMessage(tab.id, {
+        type: 'GET_PAGE_CONTENT',
+      });
+
+      setPageText(page.content);
+
+      const response = await fetch(
+        'http://127.0.0.1:3001/page/analyze',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            question: pageQuestion.trim(),
+            title: page.title,
+            url: page.url,
+            content: page.content,
+            truncated: page.truncated,
+          }),
+        }
+      );
+
+      const result = await response.json();
+
+      if (!response.ok) {
+        throw new Error(result.error || `Backend error: ${response.status}`);
+      }
+
+      setPageAnswer({
+        answer: result.answer,
+        evidence: result.evidence ?? [],
+        truncated: page.truncated,
+      });
+    } catch (error) {
+      console.error(error);
+      setPageError(
+        error instanceof Error ? error.message : 'Could not analyze the page.'
+      );
+    } finally {
+      setAnalyzing(false);
     }
   }
 
@@ -1176,6 +1252,66 @@ function App({ inSidePanel = false }: { inSidePanel?: boolean }) {
           </button>
         </div>
       )}
+
+      <section aria-labelledby="analyze-page-heading">
+        <h2 id="analyze-page-heading">Analyze Page</h2>
+
+        <input
+          type="text"
+          value={pageQuestion}
+          placeholder="Ask about this page"
+          aria-label="Question about this page"
+          onChange={(e) => setPageQuestion(e.target.value)}
+        />
+
+        <button
+          type="button"
+          onClick={() => void handleAnalyzePage()}
+          disabled={analyzing}
+          aria-describedby="analyze-page-help"
+        >
+          {analyzing ? 'Analyzing...' : 'Analyze Current Page'}
+        </button>
+
+        <p id="analyze-page-help">
+          This sends the page's visible text (not form values or passwords) to
+          Claude. It only reads the page, it never clicks or changes anything.
+        </p>
+
+        <div aria-live="polite">
+          {pageError && <p>Error: {pageError}</p>}
+
+          {pageAnswer && (
+            <div>
+              <p>{pageAnswer.answer}</p>
+
+              {pageAnswer.truncated && (
+                <p>Note: the page was long, so only part of it was read.</p>
+              )}
+
+              {pageAnswer.evidence.length > 0 && (
+                <>
+                  <h3>From the page</h3>
+                  <ul>
+                    {pageAnswer.evidence.map((line, index) => (
+                      <li key={index}>{line}</li>
+                    ))}
+                  </ul>
+                </>
+              )}
+            </div>
+          )}
+        </div>
+
+        {pageText && (
+          <details>
+            <summary>Text that was read from the page</summary>
+            <pre style={{ whiteSpace: 'pre-wrap', textAlign: 'left' }}>
+              {pageText}
+            </pre>
+          </details>
+        )}
+      </section>
 
       <section aria-labelledby="agent-mode-heading">
         <h2 id="agent-mode-heading">Agent Mode</h2>

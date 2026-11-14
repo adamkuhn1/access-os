@@ -123,6 +123,7 @@ Return exactly one JSON object, nothing else:
 
 Rules:
 - Use only element IDs from the provided controls.
+- History can include steps from earlier pages (a "click" step's value is the page it opened). Element IDs are only valid for the current page.
 - Look at the history and the current checked/selected state. Never repeat a step that already succeeded. If something already has the requested state, move on.
 - Only do what the user's goal asks for. Never fill in fields the goal doesn't mention.
 - Never invent personal information. Use values the user explicitly gave; otherwise use "ask".

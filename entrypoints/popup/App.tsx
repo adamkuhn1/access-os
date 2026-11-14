@@ -32,6 +32,12 @@ type PendingFormControl = {
 };
 
 const AGENT_MAX_STEPS = 5;
+const AGENT_MAX_NAVIGATIONS = 2;
+const PAGE_LOAD_TIMEOUT = 10000;
+
+// links the agent should never follow on its own
+const RISKY_LINK =
+  /log ?out|sign ?out|delete|remove|unsubscribe|cancel|purchase|buy|pay|checkout|check ?out|order|submit|confirm|transfer|donate/i;
 
 // same idea as the backend filter, checked again before we touch anything
 const SENSITIVE_FIELD =
@@ -41,7 +47,7 @@ const sleep = (ms: number) =>
   new Promise((resolve) => setTimeout(resolve, ms));
 
 type AgentHistoryStep = {
-  action: 'set';
+  action: 'set' | 'click';
   elementId: number;
   text: string;
   value: string | boolean;
@@ -687,9 +693,9 @@ function App({ inSidePanel = false }: { inSidePanel?: boolean }) {
     }
   }
 
-  // runs set actions only, on the tab and page it started on, until Claude
+  // runs set actions and same-site link navigation in one tab, until Claude
   // says done/ask/none, something fails, the user stops it, or we hit the limit
-  async function handleRunFormTask() {
+  async function handleRunAgent() {
     if (agentRunningRef.current || agentLoading) return;
 
     const goal = agentGoal.trim();
@@ -721,10 +727,13 @@ function App({ inSidePanel = false }: { inSidePanel?: boolean }) {
       }
 
       const tabId = tab.id;
-      const startUrl = tab.url;
+      const startOrigin = new URL(tab.url).origin;
 
-      // throws if the user hit Stop or the tab/page changed under us
-      const checkStillOk = async () => {
+      // the page we expect to be on. only changes when the agent itself navigates
+      let expectedUrl = tab.url;
+      let navigations = 0;
+
+      const checkActiveTab = async () => {
         if (agentStopRef.current) throw new Error('Stopped by user.');
 
         const [current] = await browser.tabs.query({
@@ -734,14 +743,25 @@ function App({ inSidePanel = false }: { inSidePanel?: boolean }) {
 
         if (agentStopRef.current) throw new Error('Stopped by user.');
 
-        if (current?.id !== tabId || current.url !== startUrl) {
+        if (current?.id !== tabId) {
+          throw new Error('You switched tabs, so the agent stopped.');
+        }
+
+        return current;
+      };
+
+      // throws if the user hit Stop or the tab/page changed under us
+      const checkStillOk = async () => {
+        const current = await checkActiveTab();
+
+        if (current.url !== expectedUrl) {
           throw new Error('The tab or page changed, so the agent stopped.');
         }
       };
 
       for (let step = 1; ; step++) {
         if (history.length >= AGENT_MAX_STEPS) {
-          finalMessage = `Stopped at the ${AGENT_MAX_STEPS}-step safety limit. Check the rest of the form yourself.`;
+          finalMessage = `Stopped at the ${AGENT_MAX_STEPS}-step safety limit. Check the rest yourself.`;
           break;
         }
 
@@ -764,7 +784,7 @@ function App({ inSidePanel = false }: { inSidePanel?: boolean }) {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
               goal,
-              url: startUrl,
+              url: expectedUrl,
               elements,
               history,
             }),
@@ -779,7 +799,7 @@ function App({ inSidePanel = false }: { inSidePanel?: boolean }) {
         }
 
         if (result.action === 'done') {
-          finalMessage = `Done: ${result.message} The form was not submitted.`;
+          finalMessage = `Done: ${result.message}`;
           break;
         }
 
@@ -793,12 +813,8 @@ function App({ inSidePanel = false }: { inSidePanel?: boolean }) {
           break;
         }
 
-        if (result.action !== 'set') {
-          throw new Error(
-            result.action === 'click'
-              ? 'Claude wanted to open a link, but Agent Mode only edits form fields here. Stopped.'
-              : 'Claude returned an unsupported action. Stopped.'
-          );
+        if (result.action !== 'set' && result.action !== 'click') {
+          throw new Error('Claude returned an unsupported action. Stopped.');
         }
 
         const target = elements.find(
@@ -806,7 +822,132 @@ function App({ inSidePanel = false }: { inSidePanel?: boolean }) {
         );
 
         if (!target) {
-          throw new Error('Claude picked a field that is not on the page.');
+          throw new Error('Claude picked an element that is not on the page.');
+        }
+
+        if (result.action === 'click') {
+          if (navigations >= AGENT_MAX_NAVIGATIONS) {
+            throw new Error(
+              `Stopped at the ${AGENT_MAX_NAVIGATIONS}-page navigation limit.`
+            );
+          }
+
+          // check the link ourselves, don't just trust that Claude picked a safe one
+          if (target.role !== 'link' || !target.href) {
+            throw new Error(`"${target.text}" is not a normal link. Stopped.`);
+          }
+
+          let destination: URL;
+
+          try {
+            destination = new URL(target.href);
+          } catch {
+            throw new Error(`"${target.text}" has an invalid address. Stopped.`);
+          }
+
+          if (!['http:', 'https:'].includes(destination.protocol)) {
+            throw new Error(`"${target.text}" is not a web link. Stopped.`);
+          }
+
+          if (destination.origin !== startOrigin) {
+            throw new Error(
+              `"${target.text}" leads to another website (${destination.host}). The agent only follows links on the same site for now.`
+            );
+          }
+
+          if (
+            RISKY_LINK.test(target.text) ||
+            RISKY_LINK.test(destination.pathname + destination.search)
+          ) {
+            throw new Error(
+              `"${target.text}" looks like it could log out, buy, delete or submit something, so the agent won't follow it.`
+            );
+          }
+
+          const fromUrl = new URL(expectedUrl);
+          fromUrl.hash = '';
+          const toUrl = new URL(destination);
+          toUrl.hash = '';
+
+          if (fromUrl.href === toUrl.href) {
+            throw new Error(`"${target.text}" points to this same page. Stopped.`);
+          }
+
+          setAgentProgress(`Step ${step}: opening "${target.text}"`);
+
+          const highlight = await browser.tabs.sendMessage(tabId, {
+            type: 'HIGHLIGHT_ELEMENT',
+            elementId: target.id,
+          });
+          await checkStillOk();
+
+          if (!highlight?.success) {
+            throw new Error(`Could not find "${target.text}" on the page.`);
+          }
+
+          await sleep(700);
+          await checkStillOk();
+
+          // navigate via the tabs API so the page's own click handlers never run
+          const previousUrl = expectedUrl;
+          await browser.tabs.update(tabId, { url: destination.href });
+
+          setAgentProgress(`Step ${step}: waiting for the page to load...`);
+
+          // wait for the new page and its content script, bounded by a timeout
+          const deadline = Date.now() + PAGE_LOAD_TIMEOUT;
+          let loadedUrl = '';
+
+          while (!loadedUrl) {
+            if (Date.now() > deadline) {
+              throw new Error('The next page took too long to load. Stopped.');
+            }
+
+            await sleep(250);
+            const current = await checkActiveTab();
+
+            if (
+              current.status !== 'complete' ||
+              !current.url ||
+              current.url === previousUrl
+            ) {
+              continue;
+            }
+
+            try {
+              await browser.tabs.sendMessage(tabId, {
+                type: 'GET_PAGE_ELEMENTS',
+              });
+              loadedUrl = current.url;
+            } catch {
+              // content script isn't ready yet
+            }
+          }
+
+          // redirects are fine as long as we stay on the same site
+          if (new URL(loadedUrl).origin !== startOrigin) {
+            throw new Error(
+              'The link redirected to another website, so the agent stopped.'
+            );
+          }
+
+          expectedUrl = loadedUrl;
+          navigations++;
+
+          history.push({
+            action: 'click',
+            elementId: target.id,
+            text: target.text,
+            value: loadedUrl,
+            success: true,
+          });
+
+          setAgentSteps((steps) => [
+            ...steps,
+            `Opened "${target.text}" → ${new URL(loadedUrl).pathname}`,
+          ]);
+
+          continue;
         }
 
         if (
@@ -1057,16 +1198,17 @@ function App({ inSidePanel = false }: { inSidePanel?: boolean }) {
 
         <button
           type="button"
-          onClick={() => void handleRunFormTask()}
+          onClick={() => void handleRunAgent()}
           disabled={agentLoading || agentRunning}
           aria-describedby="run-form-task-help"
         >
-          Run Form Task
+          Run Agent
         </button>
 
         <p id="run-form-task-help">
-          Run Form Task fills in fields on this page for this goal. It never
-          clicks buttons or links, opens other pages, or submits the form.
+          Run Agent works toward this goal in the current tab. It can fill in
+          form fields and follow links within the same website (up to 2
+          pages). It never clicks buttons, submits forms, or leaves the site.
         </p>
 
         {agentRunning && (

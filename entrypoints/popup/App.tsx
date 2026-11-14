@@ -117,6 +117,22 @@ function App({ inSidePanel = false }: { inSidePanel?: boolean }) {
   const agentRunningRef = useRef(false);
   const agentStopRef = useRef(false);
 
+  // analyze step: page text waiting for the user's ok, and the answer after
+  const [agentApproval, setAgentApproval] = useState<{
+    preview: string;
+    length: number;
+    truncated: boolean;
+  } | null>(null);
+  const [agentAnswer, setAgentAnswer] = useState<{
+    answer: string;
+    evidence: string[];
+    truncated: boolean;
+  } | null>(null);
+  const approvalResolveRef = useRef<((approved: boolean) => void) | null>(
+    null
+  );
+  const agentAbortRef = useRef<AbortController | null>(null);
+
   // recognition callbacks would otherwise see stale state
   const latestActionsRef = useRef({
     pendingForm,
@@ -786,6 +802,7 @@ function App({ inSidePanel = false }: { inSidePanel?: boolean }) {
     setAgentRunning(true);
     setAgentPreview(null);
     setAgentSteps([]);
+    setAgentAnswer(null);
     setAgentResult('');
     setAgentProgress('Starting...');
 
@@ -886,6 +903,91 @@ function App({ inSidePanel = false }: { inSidePanel?: boolean }) {
 
         if (result.action === 'none') {
           finalMessage = `Stopped: ${result.message}`;
+          break;
+        }
+
+        // read-only: get the page text, ask before sharing it, then answer
+        if (result.action === 'analyze') {
+          setAgentProgress(`Step ${step}: reading the page...`);
+
+          const page = await browser.tabs.sendMessage(tabId, {
+            type: 'GET_PAGE_CONTENT',
+          });
+          await checkStillOk();
+
+          if (!page?.content?.trim()) {
+            finalMessage = 'Stopped: there is no readable text on this page.';
+            break;
+          }
+
+          setAgentProgress(
+            `Step ${step}: waiting for you to approve sharing the page text...`
+          );
+
+          const approved = await new Promise<boolean>((resolve) => {
+            approvalResolveRef.current = resolve;
+            setAgentApproval({
+              preview: page.content.slice(0, 600),
+              length: page.content.length,
+              truncated: page.truncated,
+            });
+          });
+
+          approvalResolveRef.current = null;
+          setAgentApproval(null);
+
+          if (agentStopRef.current) throw new Error('Stopped by user.');
+
+          if (!approved) {
+            finalMessage =
+              'You chose not to share the page text, so nothing was sent. Stopped.';
+            break;
+          }
+
+          // the page must still be the one the user approved
+          await checkStillOk();
+
+          setAgentProgress(`Step ${step}: asking Claude about the page...`);
+
+          agentAbortRef.current = new AbortController();
+
+          const analyzeResponse = await fetch(
+            'http://127.0.0.1:3001/page/analyze',
+            {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              signal: agentAbortRef.current.signal,
+              body: JSON.stringify({
+                question: goal,
+                title: page.title,
+                url: page.url,
+                content: page.content,
+                truncated: page.truncated,
+              }),
+            }
+          );
+
+          const analysis = await analyzeResponse.json();
+          agentAbortRef.current = null;
+          await checkStillOk();
+
+          if (!analyzeResponse.ok) {
+            throw new Error(
+              analysis.error || `Backend error: ${analyzeResponse.status}`
+            );
+          }
+
+          setAgentAnswer({
+            answer: analysis.answer,
+            evidence: analysis.evidence ?? [],
+            truncated: page.truncated,
+          });
+
+          setAgentSteps((steps) => [...steps, 'Read the page and answered']);
+
+          finalMessage = page.truncated
+            ? 'Done, but the page was long and only part of it was read, so the answer may be incomplete.'
+            : 'Done: answered from this page.';
           break;
         }
 
@@ -1118,9 +1220,18 @@ function App({ inSidePanel = false }: { inSidePanel?: boolean }) {
       }
     } catch (error) {
       console.error(error);
-      finalMessage =
-        error instanceof Error ? error.message : 'The agent run failed.';
+
+      if (agentStopRef.current) {
+        // covers an aborted analyze request too
+        finalMessage = 'Stopped by user.';
+      } else {
+        finalMessage =
+          error instanceof Error ? error.message : 'The agent run failed.';
+      }
     } finally {
+      approvalResolveRef.current = null;
+      agentAbortRef.current = null;
+      setAgentApproval(null);
       agentRunningRef.current = false;
       setAgentRunning(false);
       setAgentProgress('');
@@ -1354,6 +1465,9 @@ function App({ inSidePanel = false }: { inSidePanel?: boolean }) {
               onClick={() => {
                 agentStopRef.current = true;
                 setAgentProgress('Stopping...');
+                // also end a pending approval or analysis right away
+                approvalResolveRef.current?.(false);
+                agentAbortRef.current?.abort();
               }}
             >
               Stop Agent
@@ -1376,6 +1490,67 @@ function App({ inSidePanel = false }: { inSidePanel?: boolean }) {
             </>
           )}
 
+          {agentApproval && (
+            <div role="group" aria-labelledby="share-page-heading">
+              <h3 id="share-page-heading">Share this page with Claude?</h3>
+              <p>
+                To answer, Access OS will send this page's visible text (
+                {agentApproval.length.toLocaleString()} characters) to Claude.
+                Form values and passwords are never included.
+                {agentApproval.truncated &&
+                  ' The page is long, so only the first part was read.'}
+              </p>
+
+              <details>
+                <summary>Preview the page text</summary>
+                <pre style={{ whiteSpace: 'pre-wrap', textAlign: 'left' }}>
+                  {agentApproval.preview}
+                  {agentApproval.length > agentApproval.preview.length &&
+                    '\n...'}
+                </pre>
+              </details>
+
+              <button
+                type="button"
+                onClick={() => approvalResolveRef.current?.(true)}
+              >
+                Share and Analyze
+              </button>
+
+              <button
+                type="button"
+                onClick={() => approvalResolveRef.current?.(false)}
+              >
+                Don't Share
+              </button>
+            </div>
+          )}
+
+          {agentAnswer && (
+            <div>
+              <h3>Answer</h3>
+              <p>{agentAnswer.answer}</p>
+
+              {agentAnswer.truncated && (
+                <p>
+                  Note: only part of the page was read, so this may not cover
+                  everything on it.
+                </p>
+              )}
+
+              {agentAnswer.evidence.length > 0 && (
+                <>
+                  <h4>From the page</h4>
+                  <ul>
+                    {agentAnswer.evidence.map((line, index) => (
+                      <li key={index}>{line}</li>
+                    ))}
+                  </ul>
+                </>
+              )}
+            </div>
+          )}
+
           {agentResult && <p>{agentResult}</p>}
         </div>
 
@@ -1390,6 +1565,8 @@ function App({ inSidePanel = false }: { inSidePanel?: boolean }) {
                 {agentPreview.action === 'done' && 'All done'}
                 {agentPreview.action === 'ask' && 'Claude needs more info'}
                 {agentPreview.action === 'none' && 'Nothing to do here'}
+                {agentPreview.action === 'analyze' &&
+                  'Next step: read this page to answer'}
                 {['set', 'click'].includes(agentPreview.action) &&
                   'Proposed next step (preview only)'}
               </h3>

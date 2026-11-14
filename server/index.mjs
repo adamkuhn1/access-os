@@ -118,6 +118,9 @@ Return exactly one JSON object, nothing else:
 {"action":"ask","message":"the question to ask the user"}
   The goal needs information the user hasn't given, like a value for a required field.
 
+{"action":"analyze","message":"short description of what to look for"}
+  The goal is to find out or compare information shown on the current page (prices, times, names, details), not to change anything. Reading the page will answer it. You only see the page's controls, not its text, so choose this when the answer would be in the page text. If the information is on another page of this site, navigate there first.
+
 {"action":"none","message":"why it can't be done"}
   The page has no controls that can accomplish the remaining part of the goal, or what's left is a step you aren't allowed to take. Say which part was left for the user.
 
@@ -125,6 +128,7 @@ Rules:
 - Use only element IDs from the provided controls.
 - History can include steps from earlier pages (a "click" step's value is the page it opened). Element IDs are only valid for the current page.
 - Look at the history and the current checked/selected state. Never repeat a step that already succeeded. If something already has the requested state, move on.
+- For questions or "find/compare/which/what" goals, assume they're about the page the user is on and choose "analyze" first, even if the page also has search fields. Only fill in a search form if the user gave the values to search for. Don't use "ask" or "none" for information goals just because you can't see the page text; that's what "analyze" is for.
 - Only do what the user's goal asks for. Never fill in fields the goal doesn't mention.
 - Never invent personal information. Use values the user explicitly gave; otherwise use "ask".
 - Never submit forms, press submit/buy/pay/delete buttons, or follow links that sign up, purchase, delete, or otherwise commit the user to something. If the goal asks for one of these, do everything else first, then return "none" and say which step the user has to do themselves. Only return "done" when nothing in the goal is left undone.
@@ -185,7 +189,7 @@ ${JSON.stringify({ url: url.slice(0, 500), elements: pageElements })}`,
   const action = JSON.parse(text.slice(start, end + 1));
   const message = cleanText(action.message, 300) ?? '';
 
-  if (['done', 'ask', 'none'].includes(action.action)) {
+  if (['done', 'ask', 'none', 'analyze'].includes(action.action)) {
     return sendJSON(200, {
       action: action.action,
       elementId: null,

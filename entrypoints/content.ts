@@ -9,6 +9,81 @@ export default defineContentScript({
 
     const elementById = new Map<number, HTMLElement>();
 
+    // visual-only cursor, it never clicks anything. plain div so the
+    // element scanner never picks it up
+    const cursor = document.createElement('div');
+    cursor.setAttribute('aria-hidden', 'true');
+    cursor.innerHTML = `
+      <svg width="28" height="28" viewBox="0 0 24 24">
+        <path d="M2 2 L2 19 L6.5 15 L9.5 22 L12.8 20.6 L9.8 13.8 L16 13.8 Z"
+          fill="#14b8a6" stroke="#ffffff" stroke-width="1.5"
+          stroke-linejoin="round" />
+      </svg>`;
+    Object.assign(cursor.style, {
+      position: 'fixed',
+      left: '0',
+      top: '0',
+      margin: '-2px 0 0 -2px',
+      zIndex: '2147483647',
+      pointerEvents: 'none',
+      opacity: '0',
+      transition: 'opacity 200ms',
+      filter: 'drop-shadow(0 1px 2px rgba(0, 0, 0, 0.6))',
+    });
+
+    let cursorX = window.innerWidth / 2;
+    let cursorY = window.innerHeight / 2;
+    let cursorRun = 0;
+    let hideTimer: number | undefined;
+
+    function moveCursorTo(target: HTMLElement) {
+      if (!cursor.isConnected) {
+        document.documentElement.appendChild(cursor);
+      }
+
+      // a newer move cancels the old one
+      const run = ++cursorRun;
+      window.clearTimeout(hideTimer);
+      cursor.style.opacity = '1';
+
+      const reduceMotion = window.matchMedia(
+        '(prefers-reduced-motion: reduce)'
+      ).matches;
+      const duration = reduceMotion ? 0 : 600;
+      const startX = cursorX;
+      const startY = cursorY;
+      const startTime = performance.now();
+
+      function frame(now: number) {
+        if (run !== cursorRun) return;
+
+        // re-read every frame since the page may still be smooth scrolling
+        const rect = target.getBoundingClientRect();
+        const endX = rect.left + rect.width / 2;
+        const endY = rect.top + rect.height / 2;
+
+        const t = duration
+          ? Math.min((now - startTime) / duration, 1)
+          : 1;
+        const eased = 1 - Math.pow(1 - t, 3);
+
+        cursorX = startX + (endX - startX) * eased;
+        cursorY = startY + (endY - startY) * eased;
+        cursor.style.transform = `translate(${cursorX}px, ${cursorY}px)`;
+
+        // keep following for a bit so it ends up right after scrolling stops
+        if (now - startTime < 1500) {
+          requestAnimationFrame(frame);
+        } else {
+          hideTimer = window.setTimeout(() => {
+            cursor.style.opacity = '0';
+          }, 1500);
+        }
+      }
+
+      requestAnimationFrame(frame);
+    }
+
     browser.runtime.onMessage.addListener(
       (message, _sender, sendResponse) => {
 
@@ -156,6 +231,8 @@ export default defineContentScript({
 
           target.style.outline = '4px solid #14b8a6';
           target.style.outlineOffset = '3px';
+
+          moveCursorTo(target);
 
           sendResponse({ success: true });
           return;

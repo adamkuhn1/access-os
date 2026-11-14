@@ -1,3 +1,5 @@
+import { browser } from 'wxt/browser';
+
 export default defineContentScript({
   matches: ['http://*/*', 'https://*/*'],
 
@@ -17,9 +19,21 @@ export default defineContentScript({
       console.log('Link text:', link.textContent?.trim());
       console.log('Link URL:', link.href);
       //highlight selected link   
-      link.style.outline = '3px solid #14b8a6';
+      //link.style.outline = '3px solid #14b8a6';
 
       });    
+
+
+browser.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  if (message.type === 'HIGHLIGHT_LINKS') {
+    links.forEach((link) => {
+      link.style.outline = '3px solid #14b8a6';
+    });
+
+    sendResponse({ success: true });
+  }
+});
+
   },
 });
 

@@ -6,7 +6,7 @@ export default defineContentScript({
   main() {
     console.log('Access OS is running!');
 
-    // Find interactive elements on the webpage
+    //find interactive elements on the webpage
     const buttons = document.querySelectorAll('button');
     const links = document.querySelectorAll<HTMLAnchorElement>('a[href]');
     const inputs = document.querySelectorAll('input');
@@ -32,6 +32,24 @@ browser.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
     sendResponse({ success: true });
   }
+
+if (message.type === 'CLICK_LINK' && typeof message.text === 'string') {
+  const target = Array.from(
+    document.querySelectorAll<HTMLAnchorElement>('a[href]')
+  ).find((link) =>
+    link.textContent?.trim().toLowerCase() === message.text.trim().toLowerCase()
+  );
+
+  if (target) {
+    sendResponse({ success: true });
+
+    //open the link after responding
+    setTimeout(() => target.click(), 100);
+  } else {
+    sendResponse({ success: false });
+  }
+}
+
 });
 
   },

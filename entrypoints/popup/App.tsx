@@ -10,7 +10,7 @@ async function handleTest() {
   setStatus('Connecting...');
 
   try {
-    // Find the currently active browser tab
+    //find the currently active browser tab
     const [tab] = await browser.tabs.query({
       active: true,
       currentWindow: true,
@@ -20,14 +20,19 @@ async function handleTest() {
       throw new Error('No active tab found');
     }
 
-    // Send a command to our content script
-    const response = await browser.tabs.sendMessage(tab.id, {
-      type: 'HIGHLIGHT_LINKS',
-    });
+    //send a command to our content script
+    
+const response = await browser.tabs.sendMessage(tab.id, {
+  type: 'CLICK_LINK',
+  text: 'Learn more',
+});
 
-    if (response.success) {
-      setStatus('Links highlighted!');
-    }
+if (response.success) {
+  setStatus('Opening link...');
+} else {
+  setStatus('Link not found');
+}
+
   } catch (error) {
     console.error(error);
     setStatus('Connection failed');
@@ -41,7 +46,7 @@ async function handleTest() {
       <p>Your AI-powered accessibility assistant.</p>
 
       <button onClick={handleTest}>
-        Test Connection
+        Open "Learn More"
       </button>
 
       <p>Status: {status}</p>

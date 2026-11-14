@@ -4,6 +4,8 @@ import './App.css';
 
 function App() {
   const [status, setStatus] = useState('Ready');
+const [linkText, setLinkText] = useState('Learn more');
+  
 
   
 async function handleTest() {
@@ -22,10 +24,17 @@ async function handleTest() {
 
     //send a command to our content script
     
+
+const targetText = linkText
+  .trim()
+  .replace(/^(click|open)\s+(the\s+)?/i, '')
+  .replace(/\s+link$/i, '');
+
 const response = await browser.tabs.sendMessage(tab.id, {
   type: 'CLICK_LINK',
-  text: 'Learn more',
+  text: targetText,
 });
+
 
 if (response.success) {
   setStatus('Opening link...');
@@ -44,10 +53,17 @@ if (response.success) {
     <main>
       <h1>Access OS</h1>
       <p>Your AI-powered accessibility assistant.</p>
+      
+<input
+  type="text"
+  value={linkText}
+  onChange={(e) => setLinkText(e.target.value)}
+  placeholder="Enter link text"
+/>
 
       <button onClick={handleTest}>
-        Open "Learn More"
-      </button>
+  Open Link
+</button>
 
       <p>Status: {status}</p>
     </main>

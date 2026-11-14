@@ -22,6 +22,8 @@ export default defineContentScript({
       console.log('Link URL:', link.href);
     });
 
+
+    const elementById = new Map<number, HTMLElement>();
     // Listen for commands from the Access OS popup
     browser.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
@@ -54,50 +56,84 @@ export default defineContentScript({
       }
 
       // Scan the webpage for interactive elements
-      if (message.type === 'GET_PAGE_ELEMENTS') {
+      
+if (message.type === 'GET_PAGE_ELEMENTS') {
+  const links = Array.from(
+    document.querySelectorAll<HTMLAnchorElement>('a[href]')
+  ).map((link) => ({
+    element: link,
+    text: link.getAttribute('aria-label') || link.textContent?.trim(),
+    role: 'link',
+  }));
 
-        // Find links
-        const links = Array.from(
-          document.querySelectorAll<HTMLAnchorElement>('a[href]')
-        ).map((link) => ({
-          text: link.getAttribute('aria-label') || link.textContent?.trim(),
-          role: 'link',
-        }));
+  const buttons = Array.from(
+    document.querySelectorAll<HTMLButtonElement>('button')
+  ).map((button) => ({
+    element: button,
+    text: button.getAttribute('aria-label') || button.textContent?.trim(),
+    role: 'button',
+  }));
 
-        // Find buttons
-        const buttons = Array.from(
-          document.querySelectorAll<HTMLButtonElement>('button')
-        ).map((button) => ({
-          text: button.getAttribute('aria-label') || button.textContent?.trim(),
-          role: 'button',
-        }));
+  const inputs = Array.from(
+    document.querySelectorAll<HTMLInputElement>(
+      'input:not([type="hidden"]):not([type="password"])'
+    )
+  ).map((input) => ({
+    element: input,
+    text:
+      input.getAttribute('aria-label') ||
+      input.labels?.[0]?.textContent?.trim() ||
+      input.placeholder ||
+      input.name ||
+      input.id,
+    role: 'input',
+  }));
 
-        // Find input fields (excluding passwords and hidden fields)
-        const inputs = Array.from(
-          document.querySelectorAll<HTMLInputElement>(
-            'input:not([type="hidden"]):not([type="password"])'
-          )
-        ).map((input) => ({
-          text:
-            input.getAttribute('aria-label') ||
-            input.labels?.[0]?.textContent?.trim() ||
-            input.placeholder ||
-            input.name ||
-            input.id,
-          role: 'input',
-        }));
+  // Clear IDs from previous scans
+  elementById.clear();
 
-        // Combine everything and assign temporary IDs
-        const elements = [...links, ...buttons, ...inputs]
-          .filter((element) => element.text)
-          .map((element, index) => ({
-            id: index + 1,
-            ...element,
-          }));
+  const elements = [...links, ...buttons, ...inputs]
+    .filter((item) => item.text)
+    .map(({ element, text, role }, index) => {
+      const id = index + 1;
 
-        // Send the elements back to the popup
-        sendResponse({ elements });
-      }
+      // Remember the actual HTML element
+      elementById.set(id, element);
+
+      // Only send descriptions to the AI
+      return { id, text, role };
+    });
+
+  sendResponse({ elements });
+}
+
+
+if (
+  message.type === 'HIGHLIGHT_ELEMENT' &&
+  typeof message.elementId === 'number'
+) {
+  // Find the actual HTML element using its ID
+  const target = elementById.get(message.elementId);
+
+  if (!target || !target.isConnected) {
+    sendResponse({ success: false });
+    return;
+  }
+
+  // Bring the element into view
+  target.scrollIntoView({
+    behavior: 'smooth',
+    block: 'center',
+  });
+
+  // Highlight the selected element
+  target.style.outline = '4px solid #14b8a6';
+  target.style.outlineOffset = '3px';
+
+  sendResponse({ success: true });
+}
+
+
     });
   },
 });

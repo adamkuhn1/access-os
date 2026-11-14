@@ -71,7 +71,18 @@ async function handleTest() {
       throw new Error('Claude selected an invalid element');
     }
 
-    setStatus(`Claude selected: ${selected.text} (${selected.role})`);
+    
+const highlightResult = await browser.tabs.sendMessage(tab.id, {
+  type: 'HIGHLIGHT_ELEMENT',
+  elementId: result.elementId,
+});
+
+if (highlightResult.success) {
+  setStatus(`Highlighted: ${selected.text}`);
+} else {
+  setStatus('Could not highlight the selected element.');
+}
+
 
   } catch (error) {
     console.error(error);

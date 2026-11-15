@@ -1,14 +1,10 @@
 import { browser } from 'wxt/browser';
 
-// The Access OS agent loop:
-//   observe the page -> ask Claude for ONE next step -> check it is safe and
-//   allowed -> show it with the cursor and do it -> verify it -> repeat.
-// The side panel UI is told about progress through the AgentUI callbacks, and
-// Stop is an AbortSignal checked after every await.
+// the agent loop: look at the page, ask for one step, do it, check it worked, repeat
 
 const BACKEND = 'http://127.0.0.1:3001';
 
-// limits for one run, sized for a flight search
+// limits for one run
 const MAX_STEPS = 15;
 const MAX_NAVIGATIONS = 6;
 const MAX_ANALYSES = 3;
@@ -27,23 +23,23 @@ type AgentUI = {
   answer: (answer: Answer) => void;
 };
 
-// everything one run keeps track of
+// state for one run
 type Run = {
   goal: string;
   context: string;
   ui: AgentUI;
   stop: AbortSignal;
   tabId: number;
-  url: string; // the page we expect to be on ('' for a blank tab)
+  url: string; // '' for a blank tab
   today: string;
   history: { action: string; text: string; value: string | boolean | number }[];
   navigations: number;
   waits: number;
   analyses: number;
   retries: number;
-  lastError: string; // why the last step failed, told to Claude next round
-  noEffect: Record<string, number>; // presses that changed nothing, by label
-  newTabId: number; // a tab our own click just opened (like "Visit site")
+  lastError: string; // sent back to Claude next round
+  noEffect: Record<string, number>; // presses that did nothing, by label
+  newTabId: number; // tab opened by our own click
 };
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -64,9 +60,7 @@ async function post(path: string, body: object, signal: AbortSignal) {
   return { status: response.status, data: await response.json() };
 }
 
-// runs a goal to the end and returns the final message for the user. throws
-// (with a readable message) when it has to stop early
-// context is the previous request and its result, for follow-up requests
+// runs the goal and returns the final message, throws if it has to stop early
 export async function runAgent(goal: string, ui: AgentUI, stop: AbortSignal, context = '') {
   const tab = await getActiveTab();
   if (!tab?.id) throw new Error('No active tab found.');
@@ -79,8 +73,7 @@ export async function runAgent(goal: string, ui: AgentUI, stop: AbortSignal, con
     history: [], navigations: 0, waits: 0, analyses: 0, retries: 0, lastError: '', noEffect: {}, newTabId: 0,
   };
 
-  // buttons like "Visit site" open a new tab (often without saying which tab
-  // opened it): follow any tab that opens in this window during the task
+  // follow tabs opened by things like "Visit site"
   const watchNewTabs = (opened: { id?: number; windowId?: number }) => {
     if (opened.windowId === tab.windowId && opened.id) run.newTabId = opened.id;
   };
@@ -92,10 +85,10 @@ export async function runAgent(goal: string, ui: AgentUI, stop: AbortSignal, con
 
       await checkPage(run);
       const elements = await observe(run, round);
-      if (!elements) continue; // the page was still loading
+      if (!elements) continue; // page still loading
 
       const step = await decide(run, round, elements);
-      if (!step) continue; // Claude's choice was rejected, ask again
+      if (!step) continue; // rejected, ask again
 
       const finished = await act(run, round, step, elements);
       if (finished) return finished;
@@ -106,7 +99,7 @@ export async function runAgent(goal: string, ui: AgentUI, stop: AbortSignal, con
   }
 }
 
-// throws if the user hit Stop or switched tabs
+// throws if the user pressed stop or switched tabs
 async function checkTab(run: Run) {
   if (run.stop.aborted) throw new Error('Stopped by user.');
   const tab = await getActiveTab();
@@ -115,13 +108,12 @@ async function checkTab(run: Run) {
   return tab;
 }
 
-// ...and keeps up with the page's address (sites often change it on their own)
+// sites change their own url a lot, so just keep up with it
 async function checkPage(run: Run) {
   run.url = (await checkTab(run)).url ?? '';
 }
 
-// the page's controls, or null if we waited for a loading page instead. blank
-// tabs and browser pages have no content script, so nothing to scan
+// returns null if we waited for the page to load instead
 async function observe(run: Run, round: number) {
   if (!/^https?:\/\//.test(run.url)) return [];
 
@@ -138,7 +130,7 @@ async function observe(run: Run, round: number) {
   return page.elements as PageElement[];
 }
 
-// the next step from Claude, or null if it was rejected and we should ask again
+// returns null if the step was rejected
 async function decide(run: Run, round: number, elements: PageElement[]) {
   run.ui.progress(`Step ${round}: deciding what to do next...`);
   const { status, data } = await post('/agent/next', {
@@ -146,7 +138,7 @@ async function decide(run: Run, round: number, elements: PageElement[]) {
   }, run.stop);
   await checkPage(run);
 
-  // 422: the backend rejected Claude's choice. 502: Claude gave no usable answer
+  // 422 means the step was rejected, 502 means Claude gave nothing usable
   if ((status === 422 || status === 502) && run.retries < MAX_RETRIES) {
     run.retries++;
     run.lastError = data.error || 'invalid step';
@@ -161,7 +153,7 @@ async function decide(run: Run, round: number, elements: PageElement[]) {
   return data as Step;
 }
 
-// does the step. returns a message when the run is finished
+// returns a message once the run is finished
 async function act(run: Run, round: number, step: Step, elements: PageElement[]): Promise<string | void> {
   if (step.action === 'done') return `Done: ${step.message}`;
   if (step.action === 'ask') return `I need more information: ${step.message}`;
@@ -184,8 +176,7 @@ async function act(run: Run, round: number, step: Step, elements: PageElement[])
   return interact(run, round, step, target, elements);
 }
 
-// a step failed (target moved, got covered, vanished, or refused the value).
-// let Claude pick again a few times, then give up
+// let Claude pick again a few times before giving up
 function retry(run: Run, target: PageElement, problem: string) {
   if (run.retries >= MAX_RETRIES) {
     throw new Error(`Couldn't complete "${target.text}" (${problem}). The agent stopped without searching; check the form yourself.`);
@@ -194,17 +185,17 @@ function retry(run: Run, target: PageElement, problem: string) {
   run.lastError = `the step on "${target.text}" failed: ${problem}. Pick again from the current controls`;
 }
 
-// press a control or fill in a field: point the cursor at it, do it, verify it
+// move the cursor to the target, do the step, then check it
 async function interact(run: Run, round: number, step: Step, target: PageElement, elements: PageElement[]) {
   const isPress = step.action === 'press';
 
-  // text and search boxes are typed out so the user can follow along
+  // type text out so the user can watch
   const value = step.value;
   const typeOut = typeof value === 'string' && (target.role === 'textarea' || ['text', 'search', ''].includes(target.inputType ?? ''));
   const shownValue = typeof value === 'boolean' ? (value ? 'checked / selected' : 'unchecked') : `"${value}"`;
   run.ui.progress(`Step ${round}: ${isPress ? `pressing "${target.text}"` : `${typeOut ? 'typing' : 'setting'} "${target.text}" ${shownValue}`}`);
 
-  // the cursor glides to the target first
+  // move the cursor there first
   const targetRef = { elementId: target.id, expectedText: target.text };
   const highlighted = await sendToTab(run.tabId, { type: 'HIGHLIGHT_ELEMENT', ...targetRef });
   await checkPage(run);
@@ -217,7 +208,7 @@ async function interact(run: Run, round: number, step: Step, target: PageElement
     : { type: 'SET_FORM_CONTROL', ...targetRef, value, typeOut });
   if (!result?.success) return retry(run, target, result?.error ?? 'unknown error');
 
-  // fields: the content script read the field back after the page reacted
+  // fields get read back after the page reacts
   if (!isPress && result.verified !== true) {
     throw new Error(`Verification failed: "${target.text}" doesn't show the expected value, so the agent stopped.`);
   }
@@ -235,7 +226,7 @@ async function interact(run: Run, round: number, step: Step, target: PageElement
     return;
   }
 
-  // what did the press actually do? compare the form before and after
+  // compare before and after to see what the press did
   let effect = run.url !== urlBefore ? `the page changed to ${new URL(run.url).pathname}` : '';
   if (!effect) {
     const after = (await sendToTab(run.tabId, { type: 'GET_PAGE_ELEMENTS' })).elements as PageElement[];
@@ -245,7 +236,7 @@ async function interact(run: Run, round: number, step: Step, target: PageElement
   run.history.push({ action: 'press', text: target.text, value: effect || 'no visible change' });
   run.ui.step(`Pressed "${target.text}" → ${effect || 'no visible change'}`);
 
-  // don't keep pressing things that do nothing
+  // stop instead of pressing things that do nothing
   if (!effect) {
     const times = (run.noEffect[target.text] ?? 0) + 1;
     run.noEffect[target.text] = times;
@@ -256,8 +247,7 @@ async function interact(run: Run, round: number, step: Step, target: PageElement
   }
 }
 
-// what each form control shows, like 'Departure: "Mon, Nov 16"', plus
-// selected/expanded/pressed widgets. compared before and after a press
+// what each field and widget shows, compared before and after a press
 function formSnapshot(elements: PageElement[]) {
   return elements
     .filter((e) => ['input', 'textarea', 'select', 'combobox'].includes(e.role) || /selected|checked|pressed|expanded/.test(e.state ?? ''))
@@ -268,7 +258,7 @@ function formSnapshot(elements: PageElement[]) {
     });
 }
 
-// a short note on what changed, or '' if nothing visibly did
+// short note on what changed, or '' if nothing did
 function describeChange(before: PageElement[], after: PageElement[]) {
   const remaining = formSnapshot(before);
   const added = formSnapshot(after).filter((line) => {
@@ -278,7 +268,7 @@ function describeChange(before: PageElement[], after: PageElement[]) {
     return false;
   });
   const pickers = (list: PageElement[]) => list.filter((e) => ['option', 'gridcell'].includes(e.role)).length;
-  // new controls showing up means something opened (a details panel, a dialog...)
+  // lots of new controls means something opened
   const known = new Set(before.map((e) => e.text));
   const appeared = after.filter((e) => !known.has(e.text)).length;
 
@@ -288,7 +278,7 @@ function describeChange(before: PageElement[], after: PageElement[]) {
   return '';
 }
 
-// wait for a new page and its content script, bounded by a timeout
+// wait for the new page and its content script
 async function waitForPage(run: Run, previousUrl: string) {
   run.ui.progress('Waiting for the page to load...');
   for (const deadline = Date.now() + PAGE_LOAD_TIMEOUT; Date.now() < deadline; ) {
@@ -305,8 +295,7 @@ async function waitForPage(run: Run, previousUrl: string) {
   throw new Error('The page took too long to load. Stopped.');
 }
 
-// our own press or typing can change the URL (a search running, a link
-// opening, or a page updating its address). follow along, up to a limit
+// follow url changes and new tabs caused by our own actions
 async function adoptUrlChange(run: Run) {
   await sleep(800);
   if (run.newTabId) {
@@ -319,7 +308,7 @@ async function adoptUrlChange(run: Run) {
   const loadedUrl = tab.status === 'complete' && tab.url ? tab.url : await waitForPage(run, run.url);
   const after = new URL(loadedUrl);
 
-  // a new page, not just the same page updating its search parameters
+  // only count it as a navigation if the path changed
   if (after.origin + after.pathname !== run.url.split(/[?#]/)[0]) {
     if (++run.navigations > MAX_NAVIGATIONS) throw new Error(`Stopped at the ${MAX_NAVIGATIONS}-page navigation limit.`);
     run.ui.step(`Page changed → ${after.host}${after.pathname}`);
@@ -327,7 +316,7 @@ async function adoptUrlChange(run: Run) {
   run.url = loadedUrl;
 }
 
-// open any web page by its address
+// open any http(s) address
 async function openSite(run: Run, round: number, address: string) {
   const destination = URL.canParse(address) ? new URL(address) : null;
   if (!destination || !['http:', 'https:'].includes(destination.protocol)) {
@@ -336,7 +325,7 @@ async function openSite(run: Run, round: number, address: string) {
   if (run.navigations++ >= MAX_NAVIGATIONS) throw new Error(`Stopped at the ${MAX_NAVIGATIONS}-page navigation limit.`);
 
   run.ui.progress(`Step ${round}: opening ${destination.host}...`);
-  // (re-opening the same address is a reload, so don't wait for it to change)
+  // same address means a reload, so don't wait for the url to change
   const previous = destination.href === run.url ? '' : run.url;
   await browser.tabs.update(run.tabId, { url: destination.href });
   await sleep(300);
@@ -345,13 +334,13 @@ async function openSite(run: Run, round: number, address: string) {
   run.ui.step(`Opened ${new URL(run.url).host}`);
 }
 
-// read-only: read the page's visible text (never form values) and answer from it
+// read the page text and answer from it
 async function analyzePage(run: Run, round: number, elements: PageElement[]) {
   if (run.analyses >= MAX_ANALYSES) throw new Error('The agent already read the page twice without an answer. Stopped.');
 
   const page = await sendToTab(run.tabId, { type: 'GET_PAGE_CONTENT' });
   await checkPage(run);
-  // nothing readable yet (still loading): wait and look again
+  // nothing to read yet, wait and try again
   if (!page?.content?.trim()) {
     if (run.waits++ >= MAX_WAITS) return 'Stopped: there is no readable text on this page.';
     run.ui.progress(`Step ${round}: waiting for the page to finish loading...`);
@@ -365,15 +354,14 @@ async function analyzePage(run: Run, round: number, elements: PageElement[]) {
     content: page.content,
     truncated: page.truncated,
     today: run.today,
-    // the search form's values, so the answer can confirm the results match
-    // what was searched (personal fields are never included)
+    // so the answer can check the results match the search
     searchFields: formSnapshot(elements).filter((line) => !line.includes('covered')).slice(0, 12),
   }, run.stop);
   await checkPage(run);
   if (status !== 200) throw new Error(data.error || `Backend error: ${status}`);
   run.analyses++;
 
-  // no results yet, or the wrong page for this question: tell Claude and keep going
+  // not ready or wrong page, keep going
   if (['not_ready', 'wrong_page'].includes(data.status) && run.analyses < MAX_ANALYSES) {
     run.history.push({ action: 'analyze', text: 'Read the page', value: `${data.status === 'wrong_page' ? 'Wrong page' : 'Not ready'}: ${data.answer}` });
     run.ui.step(data.status === 'wrong_page' ? 'This page didn\'t answer it, looking elsewhere' : 'Read the page: no results yet, continuing');

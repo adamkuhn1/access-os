@@ -1,12 +1,10 @@
 import { browser } from 'wxt/browser';
 
-// Access OS content script: everything that touches the web page. It scans the
-// page's controls, reads its text, and moves the animated cursor to type and
-// click. Every action re-checks its target and refuses anything risky.
+// runs in every page: scans controls, reads text, moves the cursor, clicks and types
 
-// the one thing the agent never does: spend money or delete things
+// never buy, pay or delete anything
 const RISKY = /\b(buy|purchase|pay|payment|place order|checkout|check out|delete)\b/i;
-// fields whose typed value is never reported (only whether they're filled in)
+// only say whether these are filled in, never what's in them
 const PERSONAL = /name|e-?mail|phone|address|street|zip|postal|birth|passport|card|account|ssn|password|security/i;
 const TEXT_TYPES = ['text', 'email', 'password', 'tel', 'url', 'search', 'number', 'date', 'time', 'datetime-local', 'month', 'week'];
 
@@ -31,7 +29,7 @@ export default defineContentScript({
       return r.bottom > 0 && r.right > 0 && r.top < innerHeight && r.left < innerWidth;
     };
 
-    // ---------- the animated cursor (visual only, it never clicks) ----------
+    // cursor (just visual, it doesn't click anything)
 
     const cursor = document.createElement('div');
     cursor.setAttribute('aria-hidden', 'true');
@@ -60,8 +58,7 @@ export default defineContentScript({
       cursor.style.transform = `translate(${point.x}px, ${point.y}px)`;
     };
 
-    // glide to an element over 600ms (no glide with reduced motion), and keep
-    // following it for a moment in case the page is still scrolling
+    // glide to the element and keep following it in case the page scrolls
     function moveCursorTo(target: HTMLElement) {
       const run = ++cursorRun;
       const start = cursorAt;
@@ -80,7 +77,7 @@ export default defineContentScript({
       requestAnimationFrame(frame);
     }
 
-    // a quick click animation: the pointer dips and a teal ring expands
+    // click animation
     function showCursorClick(target: HTMLElement) {
       cursorRun++;
       showCursor();
@@ -101,7 +98,7 @@ export default defineContentScript({
       }
     }
 
-    // ---------- describing the page's controls ----------
+    // describing controls
 
     const stateOf = (element: HTMLElement) => {
       const states = ['expanded', 'selected', 'pressed', 'checked'].filter((s) => element.getAttribute(`aria-${s}`) === 'true');
@@ -109,8 +106,7 @@ export default defineContentScript({
       return states.join(', ') || undefined;
     };
 
-    // is an open dialog (like a date picker) drawn on top of this element?
-    // (only dialogs count: many sites lay invisible link overlays over cards)
+    // only real dialogs count, lots of sites put invisible links over cards
     const isCovered = (element: HTMLElement) => {
       if (!onScreen(element)) return false;
       const { x, y } = center(element);
@@ -118,13 +114,11 @@ export default defineContentScript({
       return !!dialog && !dialog.contains(element);
     };
 
-    // identical buttons ("Select flight", "Visit site") are told apart by the
-    // row or card they sit in
+    // row text so identical buttons like "Select flight" can be told apart
     const near = (element: HTMLElement, label: string) =>
       label.length < 30 ? collapse(element.parentElement?.closest('li, tr, article, [role=row], [role=listitem]')?.textContent, 90) || undefined : undefined;
 
-    // how the scanner describes one element. also used to re-check an element
-    // right before acting on it
+    // also used to recheck an element right before acting on it
     function describeElement(element: HTMLElement) {
       const ariaRole = element.getAttribute('role') ?? undefined;
       const state = stateOf(element);
@@ -139,8 +133,7 @@ export default defineContentScript({
         const isChoice = ['checkbox', 'radio'].includes(element.type);
         const name = element.getAttribute('aria-label') || label?.trim() ||
           (isChoice ? element.nextSibling?.textContent?.trim() : '') || element.placeholder || element.name || element.id;
-        // share what's typed in search-style fields so the agent can see its
-        // own progress. personal fields only say whether they're filled in
+        // show typed values so the agent can see progress, but not for personal fields
         const safeValue = !isChoice && ['text', 'search', 'date', 'number', ''].includes(element.type) &&
           !PERSONAL.test(`${name} ${element.name} ${element.id} ${element.autocomplete}`);
         return {
@@ -159,8 +152,7 @@ export default defineContentScript({
         };
       }
 
-      // buttons and ARIA widgets. calendar cells often show just "16" and keep
-      // the full date on an element inside them or in a data attribute
+      // calendar cells often just say "16", the full date is inside or in a data attribute
       const labelledBy = element.getAttribute('aria-labelledby')?.split(/\s+/).map((id) => document.getElementById(id)?.textContent ?? '').join(' ');
       const innerLabel = ariaRole === 'gridcell' ? element.querySelector('[aria-label]')?.getAttribute('aria-label') : undefined;
       const date = element.dataset.iso || element.dataset.date;
@@ -174,10 +166,9 @@ export default defineContentScript({
       };
     }
 
-    // all the controls on the page, numbered for this scan
+    // every control on the page, numbered for this scan
     function scanPage() {
-      // form controls first, then widgets, buttons, day cells and links, so the
-      // important ones survive the backend's element limit
+      // most important first so they survive the element limit
       const selectors = [
         'input:not([type=hidden]):not([type=file]):not([type=reset]):not([type=image]), textarea, select',
         '[role=combobox], [role=option], [role=tab], [role=menuitem], [role=menuitemradio], [role=menuitemcheckbox], [role=switch], [role=radio], [role=checkbox]',
@@ -188,13 +179,12 @@ export default defineContentScript({
       const found = new Set<HTMLElement>();
       for (const selector of selectors) {
         document.querySelectorAll<HTMLElement>(selector).forEach((element) => {
-          // calendars render hundreds of day cells; only the visible ones matter
+          // skip off-screen calendar cells, there can be hundreds
           if (isShown(element) && !(element.getAttribute('role') === 'gridcell' && !onScreen(element))) found.add(element);
         });
       }
 
-      // busy sites (like Google Flights) have hundreds of off-screen controls,
-      // so list what's on screen first
+      // on-screen controls first
       const ordered = [...found].sort((a, b) => Number(onScreen(b)) - Number(onScreen(a)));
 
       elementById.clear();
@@ -210,16 +200,13 @@ export default defineContentScript({
           return { id: index + 1, ...info };
         });
 
-      // a visible spinner or busy region usually means results are loading
-      // (thin progress bars are often part of the layout, so only count real spinners)
+      // thin progress bars are often just part of the layout, so only count real spinners
       const busy = [...document.querySelectorAll('[aria-busy=true], [role=progressbar]')]
         .some((el) => isShown(el) && el.getBoundingClientRect().height > 16);
       return { elements, busy };
     }
 
-    // the element a message is about, only if it's still on the page and still
-    // looks like it did in the scan (so a stale ID can't hit the wrong thing).
-    // a label that only grew ("14????" -> "14$244" as a price loads) still counts
+    // the element only if it still looks like it did in the scan (labels can grow as prices load)
     function targetFor(message: Message) {
       const element = typeof message.elementId === 'number' ? elementById.get(message.elementId) : undefined;
       if (!element?.isConnected || !isShown(element) || typeof message.expectedText !== 'string') return null;
@@ -227,17 +214,15 @@ export default defineContentScript({
       return describeElement(element).text.startsWith(expected) ? element : null;
     }
 
-    // ---------- reading the page's text (only sent after the user approves) ----------
+    // reading page text
 
-    // walks visible text in DOM order and puts each block on its own line, so
-    // text inside one result card stays together. never reads form fields
+    // visible text in page order, one block per line, skipping form fields
     function getPageContent() {
       const MAX_CHARS = 10000;
       const skip = 'script, style, noscript, template, svg, canvas, iframe, input, textarea, select, option, [contenteditable=""], [contenteditable="true"]';
       const blocks = new Map<Element, Element>();
 
-      // nearest non-inline ancestor. small flex/grid rows (like one result
-      // card) count as one block; table cells are their own block
+      // small flex/grid rows like a result card count as one block
       const blockFor = (element: Element): Element => {
         let node = element;
         while (node !== document.body && node.parentElement && !node.matches('td, th')) {
@@ -284,7 +269,7 @@ export default defineContentScript({
         if (!blocks.has(parent)) blocks.set(parent, blockFor(parent));
         const next = blocks.get(parent)!;
         if (next !== block) {
-          // table cells in the same row are joined with " | "
+          // join table cells in the same row
           if (block?.matches('td, th') && next.matches('td, th') && block.parentElement === next.parentElement) line += ' | ';
           else finishLine();
           block = next;
@@ -296,10 +281,9 @@ export default defineContentScript({
       return { title: document.title, url: location.href, content: lines.join('\n'), truncated };
     }
 
-    // ---------- actions ----------
+    // actions
 
-    // outline an element and glide the cursor there. only scrolls when needed,
-    // because many sites close open menus on scroll
+    // only scroll if needed, some sites close menus on scroll
     function highlight(message: Message) {
       const target = targetFor(message);
       if (!target) return { success: false };
@@ -313,8 +297,7 @@ export default defineContentScript({
       return { success: true };
     }
 
-    // press a button, link, option, tab or date cell, after re-checking it and
-    // refusing anything consequential
+    // recheck the target and refuse anything risky before clicking
     function press(message: Message) {
       const target = targetFor(message);
       if (!target) return fail('the element changed or disappeared');
@@ -326,12 +309,11 @@ export default defineContentScript({
         return fail('that would buy, pay for or delete something, which Access OS never does');
       }
 
-      // open links in this tab, so the agent (and the user) can follow along
+      // keep links in this tab
       target.closest('a')?.removeAttribute('target');
       showCursorClick(target);
       target.focus({ preventScroll: true });
-      // a full mouse click, the way a real one looks: some sites (like Google's
-      // hotel cards) ignore element.click(), which has no click count
+      // full mouse event sequence, some sites ignore element.click()
       const { x, y } = center(target);
       const mouse = { bubbles: true, cancelable: true, composed: true, view: window, button: 0, detail: 1, clientX: x, clientY: y };
       target.dispatchEvent(new PointerEvent('pointerdown', { ...mouse, buttons: 1, pointerType: 'mouse', isPrimary: true }));
@@ -342,19 +324,17 @@ export default defineContentScript({
       return { success: true };
     }
 
-    // set a value the way the browser would, so frameworks like React notice
+    // use the native setter so React notices
     const setNativeValue = (element: Field, value: string) =>
       Object.getOwnPropertyDescriptor(Object.getPrototypeOf(element), 'value')?.set?.call(element, value);
 
-    // the text box that has focus right now, if it's a safe one to type into
+    // the focused text box, if it's safe to type into
     const focusedTextField = () => {
       const active = document.activeElement;
       return active instanceof HTMLInputElement && ['text', 'search'].includes(active.type) && !PERSONAL.test(describeElement(active).text) ? active : null;
     };
 
-    // fill in a text field, checkbox, radio button or dropdown. answers with
-    // success (the change was made) and verified (300ms later, after the
-    // page's own scripts reacted, the control still shows it)
+    // verified means the field still shows the value after the page reacted
     async function setField(message: Message) {
       const target = targetFor(message);
       const value = message.value;
@@ -377,7 +357,7 @@ export default defineContentScript({
       if (field.disabled || typeof value !== 'string' || value.length > 1000) return fail('the field is disabled or the value is invalid');
       if (field instanceof HTMLInputElement && !TEXT_TYPES.includes(field.type)) return fail('unsupported field type');
 
-      // dropdowns: pick the enabled option matching the value or its label
+      // find the matching option
       let wanted = value;
       if (field instanceof HTMLSelectElement) {
         const option = [...field.options].find((o) => !o.disabled && (o.value === value || o.text.trim().toLowerCase() === value.toLowerCase()));
@@ -396,16 +376,14 @@ export default defineContentScript({
       return { success: true, verified: field.value === wanted };
     }
 
-    // type character by character, so the user can follow along and search
-    // suggestions react like they would to a person
+    // type one letter at a time so suggestions show up like they would for a person
     async function typeOut(field: HTMLInputElement | HTMLTextAreaElement, value: string) {
       const matches = (text: string) => text.toLowerCase().startsWith(value.toLowerCase());
       field.focus({ preventScroll: true });
       setNativeValue(field, '');
       field.dispatchEvent(new Event('input', { bubbles: true }));
 
-      // some search boxes (Google Flights) open a popup with their own input as
-      // soon as you start typing: keep typing wherever the focus went
+      // google flights moves focus to a popup input while typing, so follow it
       let into: HTMLInputElement | HTMLTextAreaElement = field;
       for (const char of value) {
         into = focusedTextField() ?? into;
@@ -416,8 +394,7 @@ export default defineContentScript({
       }
       into.dispatchEvent(new Event('change', { bubbles: true }));
 
-      // let the site react, then read back whichever field holds the text now
-      // (some sites move it into a popup afterwards), and once more to be sure
+      // read back whichever field has the text now
       await sleep(300);
       if (!matches(into.value)) into = focusedTextField() ?? into;
       if (!matches(into.value)) return fail('the field did not keep what was typed');
@@ -429,15 +406,14 @@ export default defineContentScript({
       };
     }
 
-    // scroll whatever scrolls under the middle of the screen (many sites scroll
-    // an inner panel, not the page). value: screens to move, or 'top'/'bottom'
+    // scroll whatever is under the middle of the screen, often an inner panel
     function scroll(message: Message) {
       const scrolls = (el: Element) => el.scrollHeight > el.clientHeight + 20 && /auto|scroll/.test(getComputedStyle(el).overflowY);
       let box = document.elementFromPoint(innerWidth / 2, innerHeight / 2);
-      // stop at <body>: its scrolling belongs to the page itself
+      // body scrolling belongs to the page
       while (box && box !== document.body && !scrolls(box)) box = box.parentElement;
       if (box === document.body) box = null;
-      // nothing scrollable in the middle: the page itself, or else its biggest scrolling panel
+      // otherwise the page, or the biggest scrolling panel
       const page = document.scrollingElement ?? document.documentElement;
       const biggest = () => [...document.querySelectorAll('*')].filter((el) => scrolls(el) && isShown(el))
         .sort((a, b) => b.clientWidth * b.clientHeight - a.clientWidth * a.clientHeight)[0];
@@ -460,7 +436,7 @@ export default defineContentScript({
       SET_FORM_CONTROL: setField,
     };
 
-    // returning true keeps the channel open for answers that take a moment
+    // return true so we can answer async
     browser.runtime.onMessage.addListener((message: Message, _sender, sendResponse) => {
       const handler = Object.hasOwn(handlers, message.type ?? '') ? handlers[message.type!] : undefined;
       void Promise.resolve(handler?.(message)).then(sendResponse);

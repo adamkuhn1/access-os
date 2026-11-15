@@ -1,6 +1,4 @@
-// Chrome can't show the microphone prompt inside the side panel, so the panel
-// opens this page in a normal tab. It asks only when the button is pressed,
-// and releases the microphone right away.
+// the side panel can't ask for the mic, so we ask here and release it right away
 const status = document.querySelector<HTMLElement>('#status')!;
 const BLOCKED = 'The microphone is blocked for Access OS. Click the icon left of the address bar, set Microphone to Allow, then reload this page.';
 const READY = 'Microphone enabled! You can close this tab and return to Access OS.';

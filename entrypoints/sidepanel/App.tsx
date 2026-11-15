@@ -4,8 +4,7 @@ import { type Answer, runAgent } from './agent';
 
 const STOP = ['stop', 'stop agent', 'stop the agent', 'cancel task'];
 
-// a phrase made only of these words is a scroll or "go back" command, handled
-// instantly without asking Claude: "scroll down", "more", "no, back up a little"
+// phrases made only of these words are handled here as scroll/back commands
 const SCROLL_WORDS = new Set('scroll go move page keep going more again further down up a little bit lil tiny slightly back the to top bottom of all way please no ok okay now yeah and just for me can you could would it this'.split(' '));
 const SMALL = ['little', 'bit', 'lil', 'tiny', 'slightly'];
 
@@ -40,22 +39,20 @@ export default function App() {
   const listeningRef = useRef(false);
   const runningRef = useRef(false);
   const stopRef = useRef<AbortController | null>(null);
-  // what we last said out loud, to tell our own echo apart from the user
+  // last thing we said, so we can ignore our own echo
   const speakingRef = useRef(false);
   const lastSpokenRef = useRef('');
-  // a request that came in while another was running, and the last exchange,
-  // so follow-ups like "now sort by price" make sense
+  // queued request, and the last exchange for follow-ups
   const pendingRef = useRef('');
   const contextRef = useRef('');
   const scrollDirectionRef = useRef(1); // so "more" keeps going the same way
-  // speech callbacks are created once, so they call the latest functions through this
+  // speech callbacks are made once, so they get the latest functions through this
   const latest = useRef({ runTask, stopTask });
   useEffect(() => {
     latest.current = { runTask, stopTask };
   });
 
-  // start listening right away if the mic is already allowed (no click needed),
-  // and release it when the panel closes
+  // start listening right away if the mic is already allowed
   useEffect(() => {
     void navigator.permissions
       .query({ name: 'microphone' as PermissionName })
@@ -64,26 +61,26 @@ export default function App() {
     return () => stopListening();
   }, []);
 
-  // spoken feedback with the browser's built-in voice, only in voice mode
+  // only speaks in voice mode
   function say(words: string) {
     if (!words || !listeningRef.current || !('speechSynthesis' in window)) return;
     speechSynthesis.cancel();
     speakingRef.current = true;
     lastSpokenRef.current = words.toLowerCase();
     const utterance = new SpeechSynthesisUtterance(words.slice(0, 400));
-    // the echo of our voice can arrive a moment after we finish
+    // our echo can come in a bit after we stop talking
     utterance.onend = utterance.onerror = () => setTimeout(() => (speakingRef.current = false), 1000);
     speechSynthesis.speak(utterance);
   }
 
-  // is a phrase just the mic hearing our own voice? (most of its words were in what we said)
+  // true if most of the words were in what we just said
   function isEcho(spoken: string) {
     const said = new Set(lastSpokenRef.current.split(/\W+/));
     const words = spoken.split(/\W+/).filter(Boolean);
     return words.filter((word) => said.has(word)).length > words.length * 0.7;
   }
 
-  // a new request while another runs replaces it: stop that one, then start this one
+  // a new request replaces the one that's running
   async function runTask(goal: string) {
     if (!goal.trim()) return;
     if (runningRef.current) {
@@ -124,22 +121,21 @@ export default function App() {
       if (next) {
         void latest.current.runTask(next);
       } else {
-        // the status line is what screen readers announce, so it carries the answer
+        // screen readers announce the status line, so the answer goes there
         setStatus(spokenAnswer || message);
         say(spokenAnswer || message);
       }
     }
   }
 
-  // stop the run right away, including any request in flight
+  // stops the run and any speech
   function stopTask() {
     stopRef.current?.abort();
     setProgress('Stopping...');
     if ('speechSynthesis' in window) speechSynthesis.cancel();
   }
 
-  // scrolling and going back happen right away (no AI round trip), and don't
-  // interrupt a running task. returns false if the phrase is something else
+  // scroll and back run here without stopping a task. returns false for anything else
   async function quickCommand(phrase: string) {
     const words: string[] = phrase.toLowerCase().match(/[a-z']+/g) ?? [];
     if (!words.length || !words.every((word) => SCROLL_WORDS.has(word))) return false;
@@ -153,7 +149,7 @@ export default function App() {
       if (tab?.id) await browser.tabs.goBack(tab.id).catch(() => {});
       setStatus('Went back.');
       return true;
-    } else if (!has('scroll', 'more', 'again', 'further', 'keep', 'going', ...SMALL)) return true; // just "okay", "no"...
+    } else if (!has('scroll', 'more', 'again', 'further', 'keep', 'going', ...SMALL)) return true; // filler like "okay"
 
     value ??= scrollDirectionRef.current * (has(...SMALL) ? 0.3 : 0.75);
     if (!tab?.id) return true;
@@ -166,12 +162,12 @@ export default function App() {
     return true;
   }
 
-  // one finished spoken phrase. you can talk over Access OS at any time
+  // handles one finished phrase
   function handleSpeech(transcript: string) {
     const spoken = transcript.toLowerCase().replace(/[.!?]+$/, '');
     if (speakingRef.current) {
       if (isEcho(spoken)) return;
-      speechSynthesis.cancel(); // the user is talking: stop talking and listen
+      speechSynthesis.cancel(); // user is talking, so stop talking
     }
 
     if (['stop listening', 'microphone off'].includes(spoken)) return stopListening();
@@ -228,8 +224,7 @@ export default function App() {
     setStatus('Listening. Say what you want to do.');
   }
 
-  // Chrome can't show the microphone prompt inside a side panel, so the first
-  // time we open a small setup page in a normal tab and wait for the answer
+  // the side panel can't show the mic prompt, so open a setup tab the first time
   async function toggleListening() {
     if (listeningRef.current) {
       stopListening();

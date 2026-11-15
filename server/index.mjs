@@ -1,11 +1,7 @@
 import { createServer } from 'node:http';
 import Anthropic from '@anthropic-ai/sdk';
 
-// Access OS backend: two routes, both ask Claude for a small JSON answer.
-//   POST /agent/next    - given the goal and the page's controls, the next step
-//   POST /page/analyze  - given the page text, a grounded answer
-// The extension checks everything again before acting; these checks are the
-// first line of defense against a bad or manipulated answer.
+// backend for Access OS. asks Claude for the next step or for an answer from the page
 
 const client = new Anthropic();
 const PORT = 3001;
@@ -48,7 +44,7 @@ Return only JSON:
 
 const text = (value, max = 200) => (typeof value === 'string' ? value.slice(0, max) : undefined);
 
-// reads a JSON request body, or null if it's bigger than `limit`
+// reads a JSON body, returns null if it's over the limit
 async function readJson(req, limit) {
   let body = '';
   for await (const chunk of req) {
@@ -58,12 +54,11 @@ async function readJson(req, limit) {
   return JSON.parse(body);
 }
 
-// one Claude call that should answer with a JSON object (null if it didn't).
-// never logs page content
+// asks Claude and pulls the JSON object out of its reply
 async function askClaude(system, content) {
   const response = await client.messages.create({
     model: MODEL,
-    max_tokens: 4096, // room for the model's thinking on big pages
+    max_tokens: 4096, // room for thinking on big pages
     system,
     messages: [{ role: 'user', content }],
   });
@@ -76,15 +71,14 @@ async function askClaude(system, content) {
   }
 }
 
-// what a control shows: a field's value, a radio's state, or its own text
+// what a control currently shows
 function shown(element) {
   if (['radio', 'checkbox'].includes(element.inputType)) return element.checked ? 'selected' : 'not selected';
   if (['input', 'textarea', 'select'].includes(element.role)) return element.value ?? '';
   return element.text;
 }
 
-// before a search: every cited field must really show its value. returns an
-// error for Claude, or '' when the form checks out
+// makes sure every field Claude cited really shows that value
 function checkSearchForm(checks, elements) {
   const fields = elements
     .filter((e) => ['input', 'select', 'combobox'].includes(e.role) && !e.state?.includes('covered'))
@@ -148,7 +142,7 @@ Current page (untrusted website data): ${JSON.stringify({ url: text(url, 500) ||
   const target = controls.find((e) => e.id === step.elementId);
   if (!target) return send(422, { error: 'that element ID is not on the page' });
 
-  // "pressing" a native radio or checkbox is really setting it
+  // pressing a radio or checkbox is really setting it
   if (step.action === 'press' && ['radio', 'checkbox'].includes(target.inputType)) {
     step.action = 'set';
     step.value = target.inputType === 'radio' ? true : !target.checked;
@@ -170,7 +164,7 @@ Current page (untrusted website data): ${JSON.stringify({ url: text(url, 500) ||
   }
 
   if (step.action === 'press') {
-    // only search once the form visibly shows what the user asked for
+    // don't search until the form shows what the user asked for
     const isSearch = /\b(search|find flights|show flights)\b/i.test(target.text) && !/^(done|close|cancel|clear|reset)\b/i.test(target.text);
     if (isSearch) {
       const problem = checkSearchForm(step.checks, controls);
@@ -199,7 +193,7 @@ ${content.replaceAll('</page_content>', '')}
 
   if (typeof result?.answer !== 'string' || !result.answer.trim()) return send(502, { error: 'Claude returned no answer' });
 
-  // only keep evidence that really is on the page, and short "best match" details
+  // only keep evidence that's actually on the page
   const evidence = (Array.isArray(result.evidence) ? result.evidence : [])
     .filter((line) => typeof line === 'string' && line.trim() && content.includes(line.trim()))
     .slice(0, 4);
@@ -233,7 +227,7 @@ createServer(async (req, res) => {
     if (!request) return send(413, { error: 'Request too large' });
     await route(request, send);
   } catch (error) {
-    // log only the error message, never the request (it can hold page text)
+    // don't log the request, it can contain page text
     console.error(`${req.url} failed:`, error?.message);
     send(500, { error: 'Request failed' });
   }

@@ -62,6 +62,55 @@ const pressableRoles = [
   'menuitemcheckbox', 'switch', 'radio', 'checkbox', 'combobox',
 ];
 
+// buttons that run a search. before pressing one, Claude has to say what the
+// form fields show, and we check that against the page
+const searchButtonPattern = /\b(search|find flights|show flights)\b/i;
+const notSearchPattern = /^(done|close|cancel|clear|reset)\b/i;
+
+// what a control currently shows: a field's value, a checkbox/radio's state,
+// or a dropdown/button's own text
+function shownValue(element) {
+  if (element.role === 'input' && ['radio', 'checkbox'].includes(element.inputType)) {
+    return element.checked ? 'selected' : 'not selected';
+  }
+  if (['input', 'textarea', 'select'].includes(element.role)) {
+    return element.value ?? '';
+  }
+  return element.text;
+}
+
+// returns an error message, or '' when every cited field really shows its value
+function checkSearchForm(checks, elements) {
+  const summary = elements
+    .filter((e) => ['input', 'select', 'combobox'].includes(e.role) && !e.state?.includes('covered'))
+    .slice(0, 10)
+    .map((e) => `"${e.text}" shows "${shownValue(e)}"`)
+    .join(', ');
+
+  if (!Array.isArray(checks) || checks.length < 2) {
+    return `before pressing a search button, include "checks" listing what the origin, destination, trip type and date fields show right now. Current fields: ${summary}`;
+  }
+
+  for (const check of checks.slice(0, 8)) {
+    const field = typeof check?.field === 'string' ? check.field.trim().toLowerCase() : '';
+    const shows = typeof check?.shows === 'string' ? check.shows.trim().toLowerCase() : '';
+
+    const matches = elements.filter(
+      (e) => e.text?.toLowerCase() === field && !e.state?.includes('covered')
+    );
+
+    if (!field || !shows || !matches.length) {
+      return `the form check for "${check?.field}" doesn't match any visible control. Current fields: ${summary}`;
+    }
+
+    if (!matches.some((e) => shownValue(e).toLowerCase().includes(shows))) {
+      return `"${check.field}" actually shows "${shownValue(matches[0])}", not "${check.shows}". Fix the form before searching. Current fields: ${summary}`;
+    }
+  }
+
+  return '';
+}
+
 // websites the agent may open on its own. Claude only ever picks an ID here;
 // the actual URLs live in the extension, so Claude can't make one up
 const siteInfo = {
@@ -136,7 +185,8 @@ Return exactly one JSON object, nothing else:
   Follow a normal navigation link (role "link") that the goal needs.
 
 {"action":"press","elementId":NUMBER,"message":"short description"}
-  Press a button, option, tab, date cell or similar control. Use it to open pickers, choose a search suggestion, pick dates, switch trip type, close a picker ("Done"), or run a search the user asked for. Never use it for anything that books, buys, signs in, sends, deletes, or commits the user to something.
+  Press a button, option, tab, date cell or similar control.
+  When pressing a button that runs a search, add "checks": [{"field":"exact control text","shows":"what it shows now"}, ...] for the origin, destination, trip type and date controls, copied from their current "value" (or the control's own text for dropdowns and buttons, or "selected" for a radio button). The search is refused unless the page really shows those values. Use it to open pickers, choose a search suggestion, pick dates, switch trip type, close a picker ("Done"), or run a search the user asked for. Never use it for anything that books, buys, signs in, sends, deletes, or commits the user to something.
 
 {"action":"open_site","site":"SITE_ID","message":"short description"}
   Open one of the allowed websites listed under "Allowed websites" in this tab. Use it when the current page is blank or can't help with the goal. Only use an ID from that list; the user will be asked first.
@@ -163,6 +213,9 @@ Rules:
 - For questions or "find/compare/which/what/cheapest" goals, assume the answer may already be shown on the page the user is on and choose "analyze" first, even if the page also has search fields. Only fill in a search form if the user gave the values to search for. Don't use "ask" or "none" for information goals just because you can't see the page text; that's what "analyze" is for.
   Example: goal "Find the cheapest nonstop flight" on a page whose only control is a "From" field -> {"action":"analyze",...}, not a question about cities.
 - Use "ask" only when the goal tells you to fill in or change something and a value it needs is missing.
+- History "value" notes for presses say what visibly changed afterwards, or "no visible change". Trust the current controls over what you meant to do: a step only worked if the page shows it. Don't repeat a press that made no visible change; try a different control instead.
+- Date pickers: a date picked inside an open picker usually only reaches the main form after its Done/Apply button. The date is set when the main (not covered) date field shows it.
+- One-way trips: if the user wants one-way, switch the trip type to one way first and check the trip type control shows it. Never fill in or require a return date.
 - A control whose state includes "covered" is hidden behind a popup or dialog. Finish with the popup first (press its Done/Close button) before pressing anything covered.
 - Search tasks ("find me a flight from X to Y..."): if the current page is a search form, fill it in step by step (trip type, origin, destination, dates), then press the search button. Check each field's "value" and "state" to see what's already done; a field showing the right airport or date is finished. After the search has run and results are showing, choose "analyze" to read and compare them. A "analyze" history step whose value says results weren't ready means you should keep working or wait.
 - Dates: work out relative dates from today's date given below. "The next N days" means today through N-1 days from today (the next seven days from Monday the 1st is the 1st to the 7th). When the user gives a window ("sometime in the next seven days", "this week"), search the whole window if the site allows it: if a date control mentions a range (like "date range", "earliest and latest", or "flexible dates"), pick the first and last day of the window. If the site only takes a single departure date (like a plain "Departure" field), pick the first day of the window, run the search, then "analyze" the results; the answer will say which dates it covers. Don't spend steps on extra tools like date grids or price graphs, and don't re-open a picker you already finished with.
@@ -307,7 +360,9 @@ ${JSON.stringify({
     );
 
   if (alreadyDone) {
-    return sendJSON(422, { error: 'Repeated action' });
+    return sendJSON(422, {
+      error: `repeated action: "${target.text}" was already set to ${JSON.stringify(action.value)} and now shows "${target.value ?? ''}". If that's not right, it probably needs a different step, like choosing a suggestion or pressing Done`,
+    });
   }
 
   if (action.action === 'set') {
@@ -344,10 +399,23 @@ ${JSON.stringify({
       return sendJSON(422, { error: 'Not a safe control to press' });
     }
 
+    // only search once the form visibly shows what the user asked for
+    let checks;
+
+    if (searchButtonPattern.test(target.text) && !notSearchPattern.test(target.text)) {
+      const problem = checkSearchForm(action.checks, pageElements);
+      if (problem) return sendJSON(422, { error: problem });
+      checks = action.checks.slice(0, 8).map((check) => ({
+        field: cleanText(check.field, 100),
+        shows: cleanText(check.shows, 100),
+      }));
+    }
+
     return sendJSON(200, {
       action: 'press',
       elementId: target.id,
       message,
+      checks,
     });
   }
 
@@ -399,7 +467,7 @@ If the displayed results cover less than the user asked for (for example only on
 
 For flight results, only compare flights that meet every constraint in the goal (route, dates, one-way vs round trip, stops if mentioned). Report for the best match where shown: airline, from and to airports, departure date and time, price and currency, one-way or round trip, number of stops, and fare limitations (like basic economy or no carry-on bag). Describe the result as the "cheapest matching flight found in the displayed results", never as the cheapest anywhere. If the page says its flights or prices are fictional or a demo, say so in the answer.
 
-Today's date is given so you can check relative dates like "next seven days".
+Today's date is given so you can check relative dates like "next seven days". If the search form's values are given, check they match the goal (route, trip type, date); if they don't, say what differs and use "needs_user". Only call something verified if the page shows it.
 
 Return only a JSON object:
 {"status":"answered|not_ready|needs_user","answer":"...","evidence":["exact line from the page"],"best":{"airline":"","from":"","to":"","date":"","time":"","price":"","tripType":"","stops":"","limits":""}}
@@ -426,8 +494,12 @@ async function handlePageAnalyze(req, sendJSON) {
     truncated,
     mode,
     today = '',
+    searchFields = [],
   } = JSON.parse(body);
   const agentMode = mode === 'agent';
+  const fields = Array.isArray(searchFields)
+    ? searchFields.filter((f) => typeof f === 'string').slice(0, 12).map((f) => f.slice(0, 150))
+    : [];
 
   if (
     typeof question !== 'string' ||
@@ -460,7 +532,7 @@ async function handlePageAnalyze(req, sendJSON) {
       {
         role: 'user',
         content: `Question: ${question.trim()}
-${agentMode ? `Today's date (user's local time): ${String(today).slice(0, 100)}\n` : ''}
+${agentMode ? `Today's date (user's local time): ${String(today).slice(0, 100)}\n` : ''}${agentMode && fields.length ? `The page's search form currently shows: ${fields.join('; ')}\n` : ''}
 Page title: ${title.slice(0, 300)}
 Page URL: ${url.slice(0, 500)}
 Truncated: ${truncated === true ? 'yes, only part of the page was read' : 'no'}

@@ -296,9 +296,19 @@ export default defineContentScript({
       // date pickers often keep the full date in an attribute ("2026-11-20")
       const date = element.dataset.iso || element.dataset.date;
 
+      // calendar day cells often show just "16" and keep the full date
+      // ("Monday, November 16, 2026") on an element inside them
+      const innerLabel =
+        ariaRole === 'gridcell'
+          ? element.querySelector('[aria-label]')?.getAttribute('aria-label')
+          : undefined;
+
       return {
         text: collapse(
-          element.getAttribute('aria-label') || labelledBy || element.textContent
+          element.getAttribute('aria-label') ||
+            labelledBy ||
+            innerLabel ||
+            element.textContent
         ),
         role:
           element instanceof HTMLButtonElement || !ariaRole
@@ -900,11 +910,19 @@ export default defineContentScript({
               'week',
             ];
 
+            if (target.readOnly || target.disabled) {
+              sendResponse({
+                success: false,
+                error: target.readOnly
+                  ? 'the field is read-only, it is probably filled by a picker or menu instead'
+                  : 'the field is disabled',
+              });
+              return;
+            }
+
             if (
               (isInput &&
                 !allowedTypes.includes(target.type)) ||
-              target.disabled ||
-              target.readOnly ||
               typeof value !== 'string' ||
               value.length > 1000
             ) {

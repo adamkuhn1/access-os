@@ -9,6 +9,9 @@ type PageElement = {
   role: string;
   href?: string;
   inputType?: string;
+  value?: string;
+  state?: string;
+  checked?: boolean;
   options?: {
     text: string;
     value: string;
@@ -78,6 +81,41 @@ const RISKY_LINK =
 // same idea as the backend filter, checked again before we touch anything
 const SENSITIVE_FIELD =
   /password|passcode|card ?number|credit|debit|cvv|cvc|security code|expir|iban|routing|account number|ssn|social security/i;
+
+// what each form control shows right now, like 'Departure: "Mon, Nov 16"'.
+// used to check whether a press actually changed anything
+function formSnapshot(elements: PageElement[]) {
+  return elements
+    .filter(
+      (e) =>
+        ['input', 'textarea', 'select', 'combobox'].includes(e.role) ||
+        /selected|checked|pressed|expanded/.test(e.state ?? '')
+    )
+    .map((e) => {
+      if (e.role === 'input' && ['radio', 'checkbox'].includes(e.inputType ?? '')) {
+        return `${e.text}: ${e.checked ? 'selected' : 'not selected'}`;
+      }
+      if (['input', 'textarea', 'select'].includes(e.role)) {
+        return `${e.text}: "${e.value ?? ''}"`;
+      }
+      return `${e.text}${e.state ? ` [${e.state}]` : ''}`;
+    });
+}
+
+// a short note on what changed between two snapshots, '' if nothing did
+function describeChange(before: string[], after: string[], countsChanged: boolean) {
+  const remaining = [...before];
+  const added = after.filter((line) => {
+    const index = remaining.indexOf(line);
+    if (index === -1) return true;
+    remaining.splice(index, 1);
+    return false;
+  });
+
+  if (added.length) return `now ${added.slice(0, 4).join('; ')}`;
+  if (remaining.length || countsChanged) return 'a menu, picker or list opened or closed';
+  return '';
+}
 
 const sleep = (ms: number) =>
   new Promise((resolve) => setTimeout(resolve, ms));
@@ -1002,6 +1040,9 @@ function App({ inSidePanel = false }: { inSidePanel?: boolean }) {
       // a control that can't be pressed). it gets a few chances to pick again
       let rejections = 0;
       let lastError = '';
+      // presses that made no visible difference, by control label
+      const noEffect: Record<string, number> = {};
+      let noEffectTotal = 0;
 
       const checkActiveTab = async () => {
         if (agentStopRef.current) throw new Error('Stopped by user.');
@@ -1345,6 +1386,11 @@ function App({ inSidePanel = false }: { inSidePanel?: boolean }) {
                 truncated: page.truncated,
                 mode: 'agent',
                 today,
+                // the search form's values, so the answer can confirm the
+                // results match what was searched (personal fields never included)
+                searchFields: formSnapshot(elements)
+                  .filter((line) => !line.includes('[covered]'))
+                  .slice(0, 12),
               }),
             }
           );
@@ -1412,6 +1458,19 @@ function App({ inSidePanel = false }: { inSidePanel?: boolean }) {
           throw new Error('Claude picked an element that is not on the page.');
         }
 
+        // dynamic pages change under us. if a step fails (target moved, got
+        // covered, vanished, or the field refused the value), rescan and let
+        // Claude choose again, a limited number of times
+        const retryStep = (problem: string) => {
+          if (rejections >= AGENT_MAX_REJECTIONS) {
+            throw new Error(
+              `Couldn't complete the form: "${target.text}" failed (${problem}). The agent stopped without searching; check the form yourself.`
+            );
+          }
+          rejections++;
+          lastError = `the step on "${target.text}" failed: ${problem}. Pick again from the current controls`;
+        };
+
         // buttons, options, tabs and date cells. checked here, again in the
         // content script right before the click
         if (result.action === 'press') {
@@ -1440,7 +1499,8 @@ function App({ inSidePanel = false }: { inSidePanel?: boolean }) {
           await checkStillOk();
 
           if (!highlight?.success) {
-            throw new Error(`"${target.text}" changed or disappeared. Stopped.`);
+            retryStep('it changed or disappeared');
+            continue;
           }
 
           await sleep(700);
@@ -1453,8 +1513,39 @@ function App({ inSidePanel = false }: { inSidePanel?: boolean }) {
           });
 
           if (!pressed?.success) {
-            throw new Error(
-              `Could not press "${target.text}": ${pressed?.error ?? 'unknown error'}. Stopped.`
+            retryStep(pressed?.error ?? 'unknown error');
+            continue;
+          }
+
+          if (result.checks?.length) {
+            setAgentSteps((steps) => [
+              ...steps,
+              `Checked the form before searching: ${result.checks
+                .map((c: { field: string; shows: string }) => `${c.field} = ${c.shows}`)
+                .join(', ')}`,
+            ]);
+          }
+
+          // what did the press actually do? compare the form before and after
+          const urlBefore = expectedUrl;
+          await adoptUrlChange();
+
+          let effect = '';
+
+          if (expectedUrl !== urlBefore) {
+            effect = `the page changed to ${new URL(expectedUrl).pathname}`;
+          } else {
+            const after = await browser.tabs.sendMessage(tabId, {
+              type: 'GET_PAGE_ELEMENTS',
+            });
+            const afterElements = after.elements as PageElement[];
+            const countsChanged =
+              afterElements.filter((e) => ['option', 'gridcell'].includes(e.role)).length !==
+              elements.filter((e) => ['option', 'gridcell'].includes(e.role)).length;
+            effect = describeChange(
+              formSnapshot(elements),
+              formSnapshot(afterElements),
+              countsChanged
             );
           }
 
@@ -1462,13 +1553,28 @@ function App({ inSidePanel = false }: { inSidePanel?: boolean }) {
             action: 'press',
             elementId: target.id,
             text: target.text,
-            value: '',
+            value: effect || 'no visible change',
             success: true,
           });
 
-          setAgentSteps((steps) => [...steps, `Pressed "${target.text}"`]);
+          setAgentSteps((steps) => [
+            ...steps,
+            `Pressed "${target.text}" → ${effect || 'no visible change'}`,
+          ]);
 
-          await adoptUrlChange();
+          // don't keep pressing things that do nothing
+          if (!effect) {
+            const times = (noEffect[target.text] ?? 0) + 1;
+            noEffect[target.text] = times;
+            noEffectTotal++;
+
+            if (times >= 2 || noEffectTotal >= 4) {
+              throw new Error(
+                `Pressing "${target.text}" didn't visibly change anything, so the agent stopped instead of repeating it. The form may not have accepted the last step; check it yourself.`
+              );
+            }
+          }
+
           continue;
         }
 
@@ -1670,9 +1776,8 @@ function App({ inSidePanel = false }: { inSidePanel?: boolean }) {
         });
 
         if (!applied?.success) {
-          throw new Error(
-            `Could not update "${target.text}": ${applied?.error ?? 'unknown error'}`
-          );
+          retryStep(applied?.error ?? 'unknown error');
+          continue;
         }
 
         // give page scripts a moment, then read the control back

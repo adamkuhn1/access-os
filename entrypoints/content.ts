@@ -1,1180 +1,470 @@
-
 import { browser } from 'wxt/browser';
+
+// Access OS content script: everything that touches the web page. It scans the
+// page's controls, reads its text, and moves the animated cursor to type and
+// click. Every action re-checks its target and refuses anything risky.
+
+// the one thing the agent never does: spend money or delete things
+const RISKY = /\b(buy|purchase|pay|payment|place order|checkout|check out|delete)\b/i;
+// fields whose typed value is never reported (only whether they're filled in)
+const PERSONAL = /name|e-?mail|phone|address|street|zip|postal|birth|passport|card|account|ssn|password|security/i;
+const TEXT_TYPES = ['text', 'email', 'password', 'tel', 'url', 'search', 'number', 'date', 'time', 'datetime-local', 'month', 'week'];
+
+type Field = HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement;
+type Message = { type?: string; elementId?: unknown; expectedText?: unknown; value?: unknown; typeOut?: boolean };
 
 export default defineContentScript({
   matches: ['http://*/*', 'https://*/*'],
 
   main() {
-    console.log('Access OS is running!');
-
     const elementById = new Map<number, HTMLElement>();
+    const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+    const fail = (error: string) => ({ success: false, error });
+    const collapse = (text: string | null | undefined, max = 200) => (text ?? '').replace(/\s+/g, ' ').trim().slice(0, max);
+    const isShown = (element: Element) => element.checkVisibility({ checkVisibilityCSS: true });
+    const center = (element: Element) => {
+      const rect = element.getBoundingClientRect();
+      return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+    };
+    const onScreen = (element: Element) => {
+      const r = element.getBoundingClientRect();
+      return r.bottom > 0 && r.right > 0 && r.top < innerHeight && r.left < innerWidth;
+    };
 
-    // visual-only cursor, it never clicks anything. plain div so the
-    // element scanner never picks it up
+    // ---------- the animated cursor (visual only, it never clicks) ----------
+
     const cursor = document.createElement('div');
     cursor.setAttribute('aria-hidden', 'true');
-    cursor.innerHTML = `
-      <svg width="28" height="28" viewBox="0 0 24 24"
-        style="display: block; transform-origin: 2px 2px">
-        <path d="M2 2 L2 19 L6.5 15 L9.5 22 L12.8 20.6 L9.8 13.8 L16 13.8 Z"
-          fill="#14b8a6" stroke="#ffffff" stroke-width="1.5"
-          stroke-linejoin="round" />
-      </svg>`;
+    cursor.innerHTML = `<svg width="28" height="28" viewBox="0 0 24 24" style="display:block;transform-origin:2px 2px">
+      <path d="M2 2 L2 19 L6.5 15 L9.5 22 L12.8 20.6 L9.8 13.8 L16 13.8 Z" fill="#14b8a6" stroke="#fff" stroke-width="1.5" stroke-linejoin="round"/></svg>`;
     Object.assign(cursor.style, {
-      position: 'fixed',
-      left: '0',
-      top: '0',
-      margin: '-2px 0 0 -2px',
-      zIndex: '2147483647',
-      pointerEvents: 'none',
-      opacity: '0',
-      transition: 'opacity 200ms',
-      filter: 'drop-shadow(0 1px 2px rgba(0, 0, 0, 0.6))',
+      position: 'fixed', left: '0', top: '0', margin: '-2px 0 0 -2px', zIndex: '2147483647',
+      pointerEvents: 'none', opacity: '0', transition: 'opacity 200ms',
+      filter: 'drop-shadow(0 1px 2px rgba(0,0,0,0.6))',
     });
 
-    let cursorX = window.innerWidth / 2;
-    let cursorY = window.innerHeight / 2;
+    const reduceMotion = () => matchMedia('(prefers-reduced-motion: reduce)').matches;
+    let cursorAt = { x: innerWidth / 2, y: innerHeight / 2 };
     let cursorRun = 0;
     let hideTimer: number | undefined;
 
-    function moveCursorTo(target: HTMLElement) {
-      if (!cursor.isConnected) {
-        document.documentElement.appendChild(cursor);
-      }
-
-      // a newer move cancels the old one
-      const run = ++cursorRun;
+    function showCursor() {
+      if (!cursor.isConnected) document.documentElement.append(cursor);
       window.clearTimeout(hideTimer);
       cursor.style.opacity = '1';
+      hideTimer = window.setTimeout(() => (cursor.style.opacity = '0'), 3000);
+    }
 
-      const reduceMotion = window.matchMedia(
-        '(prefers-reduced-motion: reduce)'
-      ).matches;
-      const duration = reduceMotion ? 0 : 600;
-      const startX = cursorX;
-      const startY = cursorY;
+    const placeCursor = (point: { x: number; y: number }) => {
+      cursorAt = point;
+      cursor.style.transform = `translate(${point.x}px, ${point.y}px)`;
+    };
+
+    // glide to an element over 600ms (no glide with reduced motion), and keep
+    // following it for a moment in case the page is still scrolling
+    function moveCursorTo(target: HTMLElement) {
+      const run = ++cursorRun;
+      const start = cursorAt;
       const startTime = performance.now();
+      const duration = reduceMotion() ? 0 : 600;
+      showCursor();
 
-      function frame(now: number) {
+      const frame = (now: number) => {
         if (run !== cursorRun) return;
-
-        // re-read every frame since the page may still be smooth scrolling
-        const rect = target.getBoundingClientRect();
-        const endX = rect.left + rect.width / 2;
-        const endY = rect.top + rect.height / 2;
-
-        const t = duration
-          ? Math.min((now - startTime) / duration, 1)
-          : 1;
+        const end = center(target);
+        const t = duration ? Math.min((now - startTime) / duration, 1) : 1;
         const eased = 1 - Math.pow(1 - t, 3);
-
-        cursorX = startX + (endX - startX) * eased;
-        cursorY = startY + (endY - startY) * eased;
-        cursor.style.transform = `translate(${cursorX}px, ${cursorY}px)`;
-
-        // keep following for a bit so it ends up right after scrolling stops
-        if (now - startTime < 1500) {
-          requestAnimationFrame(frame);
-        } else {
-          hideTimer = window.setTimeout(() => {
-            cursor.style.opacity = '0';
-          }, 1500);
-        }
-      }
-
+        placeCursor({ x: start.x + (end.x - start.x) * eased, y: start.y + (end.y - start.y) * eased });
+        if (now - startTime < 1500) requestAnimationFrame(frame);
+      };
       requestAnimationFrame(frame);
     }
 
-    // just the visual click, the form handler still does the real work.
-    // doesn't wait for anything so the form update isn't delayed
+    // a quick click animation: the pointer dips and a teal ring expands
     function showCursorClick(target: HTMLElement) {
-      if (!cursor.isConnected) {
-        document.documentElement.appendChild(cursor);
-      }
-
-      // stop any move still running and jump to the target, which also
-      // covers the cursor having already faded out
       cursorRun++;
-      window.clearTimeout(hideTimer);
-
-      const rect = target.getBoundingClientRect();
-      cursorX = rect.left + rect.width / 2;
-      cursorY = rect.top + rect.height / 2;
-      cursor.style.transform = `translate(${cursorX}px, ${cursorY}px)`;
-      cursor.style.opacity = '1';
+      showCursor();
+      placeCursor(center(target));
 
       const ring = document.createElement('div');
-      ring.setAttribute('aria-hidden', 'true');
       Object.assign(ring.style, {
-        position: 'fixed',
-        left: `${cursorX - 20}px`,
-        top: `${cursorY - 20}px`,
-        width: '40px',
-        height: '40px',
-        boxSizing: 'border-box',
-        border: '3px solid #14b8a6',
-        borderRadius: '50%',
-        boxShadow: '0 0 0 1px #ffffff',
-        opacity: '0',
-        zIndex: '2147483646',
-        pointerEvents: 'none',
+        position: 'fixed', left: `${cursorAt.x - 20}px`, top: `${cursorAt.y - 20}px`, width: '40px', height: '40px',
+        boxSizing: 'border-box', border: '3px solid #14b8a6', borderRadius: '50%', boxShadow: '0 0 0 1px #fff',
+        opacity: '0', zIndex: '2147483646', pointerEvents: 'none',
       });
-      document.documentElement.appendChild(ring);
+      document.documentElement.append(ring);
 
-      const reduceMotion = window.matchMedia(
-        '(prefers-reduced-motion: reduce)'
-      ).matches;
-
-      // reduced motion: no shrink or expanding ring, just a quick fade
-      const ringAnimation = reduceMotion
-        ? ring.animate([{ opacity: 1 }, { opacity: 0 }], {
-            duration: 300,
-          })
-        : ring.animate(
-            [
-              { transform: 'scale(0.3)', opacity: 1 },
-              { transform: 'scale(1)', opacity: 0 },
-            ],
-            { duration: 300, easing: 'ease-out' }
-          );
-      ringAnimation.onfinish = () => ring.remove();
-
-      if (!reduceMotion) {
-        cursor.firstElementChild?.animate(
-          [
-            { transform: 'scale(1)' },
-            { transform: 'scale(0.8)' },
-            { transform: 'scale(1)' },
-          ],
-          { duration: 200 }
-        );
+      const grow = reduceMotion() ? [{ opacity: 1 }, { opacity: 0 }] : [{ transform: 'scale(0.3)', opacity: 1 }, { transform: 'scale(1)', opacity: 0 }];
+      ring.animate(grow, { duration: 300, easing: 'ease-out' }).onfinish = () => ring.remove();
+      if (!reduceMotion()) {
+        cursor.firstElementChild?.animate([{ transform: 'scale(1)' }, { transform: 'scale(0.8)' }, { transform: 'scale(1)' }], { duration: 200 });
       }
-
-      hideTimer = window.setTimeout(() => {
-        cursor.style.opacity = '0';
-      }, 1500);
     }
 
-    // labels for buttons/options the agent must never press on its own
-    const RISKY_PRESS =
-      /\b(buy|purchase|book|reserve|checkout|check out|pay|payment|place order|order now|subscribe|sign ?up|create account|register|log ?in|sign ?in|log ?out|sign ?out|delete|remove|send|post|share|donate|transfer|confirm|add to cart|cart)\b|select (this )?(flight|fare)/i;
-
-    // the only kind of form submit button the agent may press
-    const SEARCH_LABEL =
-      /\b(search|find|explore|show (flights|results)|update results|go)\b/i;
-
-    // fields whose current value we never report back
-    const PERSONAL_FIELD =
-      /name|e-?mail|phone|address|street|zip|postal|birth|passport|card|account|ssn|password|security/i;
-
-    const collapse = (text: string | null | undefined, max = 200) =>
-      (text ?? '').replace(/\s+/g, ' ').trim().slice(0, max);
-
-    const isShown = (element: Element) =>
-      element.checkVisibility({ checkVisibilityCSS: true });
+    // ---------- describing the page's controls ----------
 
     const stateOf = (element: HTMLElement) => {
-      const states: string[] = [];
-      if (element.getAttribute('aria-expanded') === 'true') states.push('expanded');
-      if (element.getAttribute('aria-selected') === 'true') states.push('selected');
-      if (element.getAttribute('aria-pressed') === 'true') states.push('pressed');
-      if (element.getAttribute('aria-checked') === 'true') states.push('checked');
-      if (
-        element.getAttribute('aria-disabled') === 'true' ||
-        (element as HTMLButtonElement).disabled
-      ) {
-        states.push('disabled');
-      }
-      return states.length ? states.join(', ') : undefined;
+      const states = ['expanded', 'selected', 'pressed', 'checked'].filter((s) => element.getAttribute(`aria-${s}`) === 'true');
+      if (element.getAttribute('aria-disabled') === 'true' || (element as HTMLButtonElement).disabled) states.push('disabled');
+      return states.join(', ') || undefined;
     };
 
-    // is something else (like an open dialog) drawn on top of this element?
-    // only checked for elements on screen
+    // is an open dialog (like a date picker) drawn on top of this element?
+    // (only dialogs count: many sites lay invisible link overlays over cards)
     const isCovered = (element: HTMLElement) => {
-      const rect = element.getBoundingClientRect();
-      const x = rect.left + rect.width / 2;
-      const y = rect.top + rect.height / 2;
-
-      if (x < 0 || y < 0 || x > window.innerWidth || y > window.innerHeight) {
-        return false;
-      }
-
-      const top = document.elementFromPoint(x, y);
-      return !!top && !element.contains(top) && !top.contains(element);
+      if (!onScreen(element)) return false;
+      const { x, y } = center(element);
+      const dialog = document.elementFromPoint(x, y)?.closest('dialog, [role=dialog], [aria-modal=true]');
+      return !!dialog && !dialog.contains(element);
     };
+
+    // identical buttons ("Select flight", "Visit site") are told apart by the
+    // row or card they sit in
+    const near = (element: HTMLElement, label: string) =>
+      label.length < 30 ? collapse(element.parentElement?.closest('li, tr, article, [role=row], [role=listitem]')?.textContent, 90) || undefined : undefined;
 
     // how the scanner describes one element. also used to re-check an element
-    // right before acting on it, so a stale ID can't hit the wrong thing
+    // right before acting on it
     function describeElement(element: HTMLElement) {
       const ariaRole = element.getAttribute('role') ?? undefined;
       const state = stateOf(element);
+      const label = (element as HTMLInputElement).labels?.[0]?.textContent;
 
       if (element instanceof HTMLAnchorElement) {
-        return {
-          text: collapse(element.getAttribute('aria-label') || element.textContent),
-          role: 'link',
-          href: element.href,
-        };
+        const text = collapse(element.getAttribute('aria-label') || element.textContent);
+        return { text, role: 'link', near: near(element, text) };
       }
 
-      if (element instanceof HTMLInputElement) {
-        if (['submit', 'button'].includes(element.type)) {
-          return {
-            text: collapse(element.getAttribute('aria-label') || element.value),
-            role: 'button',
-            state,
-          };
-        }
-
+      if (element instanceof HTMLInputElement && !['submit', 'button'].includes(element.type)) {
         const isChoice = ['checkbox', 'radio'].includes(element.type);
-        const label =
-          element.getAttribute('aria-label') ||
-          element.labels?.[0]?.textContent?.trim() ||
-          (isChoice ? element.nextSibling?.textContent?.trim() : undefined) ||
-          element.placeholder ||
-          element.name ||
-          element.id;
-
+        const name = element.getAttribute('aria-label') || label?.trim() ||
+          (isChoice ? element.nextSibling?.textContent?.trim() : '') || element.placeholder || element.name || element.id;
         // share what's typed in search-style fields so the agent can see its
-        // own progress, but never personal fields
-        const safeValue =
-          !isChoice &&
-          ['text', 'search', 'date', 'number', ''].includes(element.type) &&
-          !PERSONAL_FIELD.test(`${label} ${element.name} ${element.id}`) &&
-          !/name|email|tel|address|postal|bday|cc-|username/i.test(
-            element.autocomplete
-          );
-
+        // own progress. personal fields only say whether they're filled in
+        const safeValue = !isChoice && ['text', 'search', 'date', 'number', ''].includes(element.type) &&
+          !PERSONAL.test(`${name} ${element.name} ${element.id} ${element.autocomplete}`);
         return {
-          text: collapse(isChoice ? `${element.name || element.type}: ${label}` : label),
-          role: 'input',
-          inputType: element.type,
-          ariaRole,
-          state,
-          value: safeValue ? collapse(element.value, 100) : undefined,
-          choiceValue: isChoice ? element.value : undefined,
+          text: collapse(isChoice ? `${element.name || element.type}: ${name}` : name),
+          role: 'input', inputType: element.type, state,
+          value: isChoice ? undefined : safeValue ? collapse(element.value, 100) : element.value ? '(filled in)' : '',
           checked: isChoice ? element.checked : undefined,
         };
       }
 
-      if (element instanceof HTMLTextAreaElement) {
+      if (element instanceof HTMLTextAreaElement || element instanceof HTMLSelectElement) {
         return {
-          text: collapse(
-            element.getAttribute('aria-label') ||
-              element.labels?.[0]?.textContent ||
-              element.placeholder ||
-              element.name ||
-              element.id
-          ),
-          role: 'textarea',
+          text: collapse(element.getAttribute('aria-label') || label || element.name || element.id),
+          role: element instanceof HTMLSelectElement ? 'select' : 'textarea',
+          options: element instanceof HTMLSelectElement ? Array.from(element.options, (o) => ({ text: o.text.trim() })) : undefined,
         };
       }
 
-      if (element instanceof HTMLSelectElement) {
-        return {
-          text: collapse(
-            element.getAttribute('aria-label') ||
-              element.labels?.[0]?.textContent ||
-              element.name ||
-              element.id
-          ),
-          role: 'select',
-          options: Array.from(element.options).map((option) => ({
-            text: option.text.trim(),
-            value: option.value,
-            disabled: option.disabled,
-          })),
-        };
-      }
-
-      const labelledBy = element
-        .getAttribute('aria-labelledby')
-        ?.split(/\s+/)
-        .map((id) => document.getElementById(id)?.textContent ?? '')
-        .join(' ');
-
-      // date pickers often keep the full date in an attribute ("2026-11-20")
+      // buttons and ARIA widgets. calendar cells often show just "16" and keep
+      // the full date on an element inside them or in a data attribute
+      const labelledBy = element.getAttribute('aria-labelledby')?.split(/\s+/).map((id) => document.getElementById(id)?.textContent ?? '').join(' ');
+      const innerLabel = ariaRole === 'gridcell' ? element.querySelector('[aria-label]')?.getAttribute('aria-label') : undefined;
       const date = element.dataset.iso || element.dataset.date;
-
-      // calendar day cells often show just "16" and keep the full date
-      // ("Monday, November 16, 2026") on an element inside them
-      const innerLabel =
-        ariaRole === 'gridcell'
-          ? element.querySelector('[aria-label]')?.getAttribute('aria-label')
-          : undefined;
-
+      const text = collapse(element.getAttribute('aria-label') || labelledBy || innerLabel || (element as HTMLInputElement).value || element.textContent);
       return {
-        text: collapse(
-          element.getAttribute('aria-label') ||
-            labelledBy ||
-            innerLabel ||
-            element.textContent
-        ),
-        role:
-          element instanceof HTMLButtonElement || !ariaRole
-            ? 'button'
-            : ariaRole,
+        text,
+        near: near(element, text),
+        role: element instanceof HTMLButtonElement || element instanceof HTMLInputElement || !ariaRole ? 'button' : ariaRole,
         state,
         date: date && /^\d{4}-\d{2}-\d{2}$/.test(date) ? date : undefined,
       };
     }
 
-    // the element for this ID, only if it still looks exactly like it did in
-    // the scan the caller is acting on
-    function checkedTarget(elementId: unknown, expectedText: unknown) {
-      if (typeof elementId !== 'number') return null;
-
-      const element = elementById.get(elementId);
-
-      if (!element || !element.isConnected || !isShown(element)) return null;
-
-      // same DOM node, so a label that only grew (like a price loading in
-      // next to a date, "14????" -> "14$244") is still the same control
-      if (
-        typeof expectedText === 'string' &&
-        !describeElement(element).text.startsWith(
-          expectedText.replace(/[\s?…—-]+$/, '')
-        )
-      ) {
-        return null;
+    // all the controls on the page, numbered for this scan
+    function scanPage() {
+      // form controls first, then widgets, buttons, day cells and links, so the
+      // important ones survive the backend's element limit
+      const selectors = [
+        'input:not([type=hidden]):not([type=file]):not([type=reset]):not([type=image]), textarea, select',
+        '[role=combobox], [role=option], [role=tab], [role=menuitem], [role=menuitemradio], [role=menuitemcheckbox], [role=switch], [role=radio], [role=checkbox]',
+        'button, [role=button]',
+        '[role=gridcell]',
+        'a[href]',
+      ];
+      const found = new Set<HTMLElement>();
+      for (const selector of selectors) {
+        document.querySelectorAll<HTMLElement>(selector).forEach((element) => {
+          // calendars render hundreds of day cells; only the visible ones matter
+          if (isShown(element) && !(element.getAttribute('role') === 'gridcell' && !onScreen(element))) found.add(element);
+        });
       }
 
-      return element;
+      // busy sites (like Google Flights) have hundreds of off-screen controls,
+      // so list what's on screen first
+      const ordered = [...found].sort((a, b) => Number(onScreen(b)) - Number(onScreen(a)));
+
+      elementById.clear();
+      const elements = ordered
+        .map((element) => {
+          const info = describeElement(element);
+          return { element, ...info, state: isCovered(element) ? [info.state, 'covered'].filter(Boolean).join(', ') : info.state };
+        })
+        .filter((item) => item.text)
+        .slice(0, 350)
+        .map(({ element, ...info }, index) => {
+          elementById.set(index + 1, element);
+          return { id: index + 1, ...info };
+        });
+
+      // a visible spinner or busy region usually means results are loading
+      // (thin progress bars are often part of the layout, so only count real spinners)
+      const busy = [...document.querySelectorAll('[aria-busy=true], [role=progressbar]')]
+        .some((el) => isShown(el) && el.getBoundingClientRect().height > 16);
+      return { elements, busy };
     }
 
-    // read-only text extraction. walks visible text in DOM order and puts each
-    // block (div, p, li, heading...) on its own line, so text inside one
-    // result card stays together. table cells in a row are joined with " | "
+    // the element a message is about, only if it's still on the page and still
+    // looks like it did in the scan (so a stale ID can't hit the wrong thing).
+    // a label that only grew ("14????" -> "14$244" as a price loads) still counts
+    function targetFor(message: Message) {
+      const element = typeof message.elementId === 'number' ? elementById.get(message.elementId) : undefined;
+      if (!element?.isConnected || !isShown(element) || typeof message.expectedText !== 'string') return null;
+      const expected = message.expectedText.replace(/[\s?…—-]+$/, '');
+      return describeElement(element).text.startsWith(expected) ? element : null;
+    }
+
+    // ---------- reading the page's text (only sent after the user approves) ----------
+
+    // walks visible text in DOM order and puts each block on its own line, so
+    // text inside one result card stays together. never reads form fields
     function getPageContent() {
       const MAX_CHARS = 10000;
-      const MAX_TEXT_NODES = 20000;
+      const skip = 'script, style, noscript, template, svg, canvas, iframe, input, textarea, select, option, [contenteditable=""], [contenteditable="true"]';
+      const blocks = new Map<Element, Element>();
 
-      const skipSelector =
-        'script, style, noscript, template, svg, canvas, iframe, object, ' +
-        'input, textarea, select, option, [contenteditable=""], [contenteditable="true"]';
-
-      const visibleCache = new Map<Element, boolean>();
-      const blockCache = new Map<Element, Element>();
-
-      const isVisible = (element: Element) => {
-        let visible = visibleCache.get(element);
-
-        if (visible === undefined) {
-          visible = element.checkVisibility({
-            checkOpacity: true,
-            checkVisibilityCSS: true,
-          });
-          visibleCache.set(element, visible);
-        }
-
-        return visible;
-      };
-
-      // nearest ancestor that isn't inline, table cells count as their own block
-      const blockFor = (element: Element) => {
-        const cached = blockCache.get(element);
-        if (cached) return cached;
-
-        let node: Element = element;
-
-        while (node !== document.body && node.parentElement) {
-          if (node.matches('td, th')) break;
-
-          const display = getComputedStyle(node).display;
+      // nearest non-inline ancestor. small flex/grid rows (like one result
+      // card) count as one block; table cells are their own block
+      const blockFor = (element: Element): Element => {
+        let node = element;
+        while (node !== document.body && node.parentElement && !node.matches('td, th')) {
           const parent: Element = node.parentElement;
-
-          // items in a small flex/grid row (like one result card) share a line
-          const parentDisplay = getComputedStyle(parent).display;
-          const inSmallRow =
-            /flex|grid/.test(parentDisplay) &&
-            (parent.textContent?.length ?? 0) <= 300;
-
-          if (
-            !display.startsWith('inline') &&
-            display !== 'contents' &&
-            !inSmallRow
-          ) {
-            break;
-          }
-
+          const inSmallRow = /flex|grid/.test(getComputedStyle(parent).display) && (parent.textContent?.length ?? 0) <= 300;
+          const display = getComputedStyle(node).display;
+          if (!display.startsWith('inline') && display !== 'contents' && !inSmallRow) break;
           node = parent;
         }
-
-        blockCache.set(element, node);
         return node;
       };
 
-      const prefixFor = (block: Element) => {
-        const heading = block.closest('h1, h2, h3, h4, h5, h6');
-        if (heading) return '#'.repeat(Number(heading.tagName[1])) + ' ';
-        if (block.closest('li')) return '- ';
-        return '';
-      };
-
+      // prefer the page's main area over menus and footers
+      const main = document.querySelector('main, [role=main]');
+      const root = main && collapse(main.textContent, 300).length >= 200 ? main : document.body;
+      const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
       const lines: string[] = [];
+      let block: Element | null = null;
+      let line = '';
       let length = 0;
       let truncated = false;
-      let currentBlock: Element | null = null;
-      let currentLine = '';
 
       const finishLine = () => {
-        const text = currentLine.replace(/\s+/g, ' ').trim();
-        currentLine = '';
-
-        if (!text || !currentBlock) return;
-
-        const line = prefixFor(currentBlock) + text;
-        if (line === lines[lines.length - 1]) return;
-
-        if (length + line.length > MAX_CHARS) {
+        const textLine = collapse(line, 2000);
+        line = '';
+        if (!textLine || !block) return;
+        const heading = block.closest('h1, h2, h3, h4, h5, h6');
+        const full = (heading ? '#'.repeat(Number(heading.tagName[1])) + ' ' : block.closest('li') ? '- ' : '') + textLine;
+        if (full === lines.at(-1)) return;
+        if (length + full.length > MAX_CHARS) {
           truncated = true;
-          return;
+        } else {
+          lines.push(full);
+          length += full.length + 1;
         }
-
-        lines.push(line);
-        length += line.length + 1;
       };
 
-      // prefer the page's main area over menus and footers when it has one
-      const main = document.querySelector('main, [role="main"]');
-      const root =
-        main && collapse(main.textContent, 300).length >= 200
-          ? main
-          : document.body;
+      for (let visited = 0; walker.nextNode() && !truncated; visited++) {
+        if (visited > 20000) truncated = true;
+        const parent = walker.currentNode.parentElement;
+        if (!parent || !walker.currentNode.textContent?.trim() || parent.closest(skip)) continue;
+        if (!parent.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true })) continue;
 
-      const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
-
-      let visited = 0;
-
-      while (walker.nextNode()) {
-        if (truncated) break;
-
-        if (++visited > MAX_TEXT_NODES) {
-          truncated = true;
-          break;
+        if (!blocks.has(parent)) blocks.set(parent, blockFor(parent));
+        const next = blocks.get(parent)!;
+        if (next !== block) {
+          // table cells in the same row are joined with " | "
+          if (block?.matches('td, th') && next.matches('td, th') && block.parentElement === next.parentElement) line += ' | ';
+          else finishLine();
+          block = next;
         }
-
-        const textNode = walker.currentNode as Text;
-        const parent = textNode.parentElement;
-        const text = textNode.data;
-
-        if (!parent || !text.trim()) continue;
-        if (cursor.contains(parent)) continue;
-        if (parent.closest(skipSelector)) continue;
-        if (!isVisible(parent)) continue;
-
-        const block = blockFor(parent);
-
-        if (block !== currentBlock) {
-          const sameRow =
-            currentBlock?.matches('td, th') &&
-            block.matches('td, th') &&
-            currentBlock.parentElement === block.parentElement;
-
-          if (sameRow) {
-            currentLine += ' | ';
-            currentBlock = block;
-          } else {
-            finishLine();
-            currentBlock = block;
-          }
-        }
-
-        currentLine += ' ' + text;
+        line += ' ' + walker.currentNode.textContent;
       }
-
       finishLine();
 
+      return { title: document.title, url: location.href, content: lines.join('\n'), truncated };
+    }
+
+    // ---------- actions ----------
+
+    // outline an element and glide the cursor there. only scrolls when needed,
+    // because many sites close open menus on scroll
+    function highlight(message: Message) {
+      const target = targetFor(message);
+      if (!target) return { success: false };
+      const r = target.getBoundingClientRect();
+      if (r.top < 0 || r.left < 0 || r.bottom > innerHeight || r.right > innerWidth) {
+        target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      }
+      target.style.outline = '4px solid #14b8a6';
+      target.style.outlineOffset = '3px';
+      moveCursorTo(target);
+      return { success: true };
+    }
+
+    // press a button, link, option, tab or date cell, after re-checking it and
+    // refusing anything consequential
+    function press(message: Message) {
+      const target = targetFor(message);
+      if (!target) return fail('the element changed or disappeared');
+
+      const label = describeElement(target).text;
+      if (stateOf(target)?.includes('disabled')) return fail('that control is disabled');
+      if (isCovered(target)) return fail('it is covered by a popup or dialog, close that first (for example with its Done button)');
+      if (RISKY.test(label) || (target instanceof HTMLAnchorElement && RISKY.test(target.href))) {
+        return fail('that would buy, pay for or delete something, which Access OS never does');
+      }
+
+      // open links in this tab, so the agent (and the user) can follow along
+      target.closest('a')?.removeAttribute('target');
+      showCursorClick(target);
+      target.focus({ preventScroll: true });
+      // a full mouse click, the way a real one looks: some sites (like Google's
+      // hotel cards) ignore element.click(), which has no click count
+      const { x, y } = center(target);
+      const mouse = { bubbles: true, cancelable: true, composed: true, view: window, button: 0, detail: 1, clientX: x, clientY: y };
+      target.dispatchEvent(new PointerEvent('pointerdown', { ...mouse, buttons: 1, pointerType: 'mouse', isPrimary: true }));
+      target.dispatchEvent(new MouseEvent('mousedown', { ...mouse, buttons: 1 }));
+      target.dispatchEvent(new PointerEvent('pointerup', { ...mouse, pointerType: 'mouse', isPrimary: true }));
+      target.dispatchEvent(new MouseEvent('mouseup', mouse));
+      target.dispatchEvent(new MouseEvent('click', mouse));
+      return { success: true };
+    }
+
+    // set a value the way the browser would, so frameworks like React notice
+    const setNativeValue = (element: Field, value: string) =>
+      Object.getOwnPropertyDescriptor(Object.getPrototypeOf(element), 'value')?.set?.call(element, value);
+
+    // the text box that has focus right now, if it's a safe one to type into
+    const focusedTextField = () => {
+      const active = document.activeElement;
+      return active instanceof HTMLInputElement && ['text', 'search'].includes(active.type) && !PERSONAL.test(describeElement(active).text) ? active : null;
+    };
+
+    // fill in a text field, checkbox, radio button or dropdown. answers with
+    // success (the change was made) and verified (300ms later, after the
+    // page's own scripts reacted, the control still shows it)
+    async function setField(message: Message) {
+      const target = targetFor(message);
+      const value = message.value;
+      if (!target) return fail('the element changed or disappeared');
+
+      if (target instanceof HTMLInputElement && ['checkbox', 'radio'].includes(target.type)) {
+        if (target.disabled || typeof value !== 'boolean' || (target.type === 'radio' && !value)) return fail('invalid selection');
+        showCursorClick(target);
+        if (target.checked !== value) target.click();
+        if (target.checked !== value) return fail('the selection did not change');
+        await sleep(300);
+        return { success: true, verified: target.checked === value };
+      }
+
+      const field = target as Field;
+      if (!(field instanceof HTMLInputElement || field instanceof HTMLTextAreaElement || field instanceof HTMLSelectElement)) {
+        return fail('that is not a form field');
+      }
+      if ((field as HTMLInputElement).readOnly) return fail('the field is read-only, it is probably filled by a picker or menu instead');
+      if (field.disabled || typeof value !== 'string' || value.length > 1000) return fail('the field is disabled or the value is invalid');
+      if (field instanceof HTMLInputElement && !TEXT_TYPES.includes(field.type)) return fail('unsupported field type');
+
+      // dropdowns: pick the enabled option matching the value or its label
+      let wanted = value;
+      if (field instanceof HTMLSelectElement) {
+        const option = [...field.options].find((o) => !o.disabled && (o.value === value || o.text.trim().toLowerCase() === value.toLowerCase()));
+        if (!option) return fail('no such option');
+        wanted = option.value;
+      }
+
+      showCursorClick(field);
+      if (message.typeOut && !(field instanceof HTMLSelectElement) && value.length <= 80) return typeOut(field, value);
+
+      setNativeValue(field, wanted);
+      if (field.value !== wanted) return fail('the field did not accept the value');
+      field.dispatchEvent(new Event('input', { bubbles: true }));
+      field.dispatchEvent(new Event('change', { bubbles: true }));
+      await sleep(300);
+      return { success: true, verified: field.value === wanted };
+    }
+
+    // type character by character, so the user can follow along and search
+    // suggestions react like they would to a person
+    async function typeOut(field: HTMLInputElement | HTMLTextAreaElement, value: string) {
+      const matches = (text: string) => text.toLowerCase().startsWith(value.toLowerCase());
+      field.focus({ preventScroll: true });
+      setNativeValue(field, '');
+      field.dispatchEvent(new Event('input', { bubbles: true }));
+
+      // some search boxes (Google Flights) open a popup with their own input as
+      // soon as you start typing: keep typing wherever the focus went
+      let into: HTMLInputElement | HTMLTextAreaElement = field;
+      for (const char of value) {
+        into = focusedTextField() ?? into;
+        if (!into.isConnected) break;
+        setNativeValue(into, into.value + char);
+        into.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: char }));
+        await sleep(45);
+      }
+      into.dispatchEvent(new Event('change', { bubbles: true }));
+
+      // let the site react, then read back whichever field holds the text now
+      // (some sites move it into a popup afterwards), and once more to be sure
+      await sleep(300);
+      if (!matches(into.value)) into = focusedTextField() ?? into;
+      if (!matches(into.value)) return fail('the field did not keep what was typed');
+      await sleep(300);
       return {
-        title: document.title,
-        url: location.href,
-        content: lines.join('\n'),
-        truncated,
+        success: true,
+        verified: matches(into.value),
+        movedTo: into === field ? undefined : describeElement(into).text,
       };
     }
 
-    browser.runtime.onMessage.addListener(
-      (message, _sender, sendResponse) => {
-
-        // old test - highlights every link
-        if (message.type === 'HIGHLIGHT_LINKS') {
-          document
-            .querySelectorAll<HTMLAnchorElement>('a[href]')
-            .forEach((link) => {
-              link.style.outline = '3px solid #14b8a6';
-            });
-
-          sendResponse({ success: true });
-          return;
-        }
-
-        if (message.type === 'GET_PAGE_ELEMENTS') {
-          // form controls first, then widgets, buttons and links, so the
-          // important ones survive the backend's element limit
-          const selectors = [
-            'input:not([type="hidden"]):not([type="password"]):not([type="file"]):not([type="reset"]):not([type="image"])',
-            'textarea',
-            'select',
-            '[role="combobox"], [role="option"], [role="tab"], [role="menuitem"], [role="menuitemradio"], [role="menuitemcheckbox"], [role="switch"], [role="radio"], [role="checkbox"]',
-            'button, [role="button"]',
-            '[role="gridcell"]',
-            'a[href]',
-          ];
-
-          // calendars can render hundreds of day cells; only the ones on
-          // screen are useful, and the rest would push out other controls
-          const onScreen = (element: Element) => {
-            const rect = element.getBoundingClientRect();
-            return (
-              rect.bottom > 0 &&
-              rect.right > 0 &&
-              rect.top < window.innerHeight &&
-              rect.left < window.innerWidth
-            );
-          };
-
-          const seen = new Set<Element>();
-          const found: HTMLElement[] = [];
-
-          for (const selector of selectors) {
-            document.querySelectorAll<HTMLElement>(selector).forEach((element) => {
-              if (seen.has(element) || cursor.contains(element)) return;
-              seen.add(element);
-              if (!isShown(element)) return;
-              if (element.getAttribute('role') === 'gridcell' && !onScreen(element)) return;
-              found.push(element);
-            });
-          }
-
-          elementById.clear();
-
-          // busy sites (like Google Flights) have hundreds of off-screen
-          // controls, so list what's on screen first
-          const ordered = [
-            ...found.filter(onScreen),
-            ...found.filter((element) => !onScreen(element)),
-          ];
-
-          const elements = ordered
-            .map((element) => {
-              const info = describeElement(element);
-              const state = isCovered(element)
-                ? [info.state, 'covered'].filter(Boolean).join(', ')
-                : info.state;
-              return { element, ...info, state };
-            })
-            .filter((item) => item.text)
-            .slice(0, 350)
-            .map(({ element, ...data }, index) => {
-              const id = index + 1;
-              elementById.set(id, element);
-
-              return { id, ...data };
-            });
-
-          // a visible spinner or busy region usually means results are loading
-          const busy = Array.from(
-            document.querySelectorAll('[aria-busy="true"], [role="progressbar"]')
-          ).some(isShown);
-
-          sendResponse({ elements, busy });
-          return;
-        }
-
-        // press a button, option, tab or date cell. only after re-checking it
-        // and refusing anything that looks consequential
-        if (message.type === 'PRESS_ELEMENT') {
-          const target = checkedTarget(message.elementId, message.expectedText);
-
-          if (!target) {
-            sendResponse({
-              success: false,
-              error: 'The element changed or disappeared',
-            });
-            return;
-          }
-
-          const label = describeElement(target).text;
-
-          if (stateOf(target)?.includes('disabled')) {
-            sendResponse({ success: false, error: 'That control is disabled' });
-            return;
-          }
-
-          if (isCovered(target)) {
-            sendResponse({
-              success: false,
-              error:
-                'it is covered by a popup or dialog, close that first (for example with its Done or Close button)',
-            });
-            return;
-          }
-
-          if (RISKY_PRESS.test(label)) {
-            sendResponse({
-              success: false,
-              error: 'That looks like it could buy, book, sign in or send something',
-            });
-            return;
-          }
-
-          const form =
-            target instanceof HTMLButtonElement ||
-            target instanceof HTMLInputElement
-              ? target.form
-              : null;
-
-          const submitsForm =
-            !!form &&
-            ((target instanceof HTMLButtonElement && target.type === 'submit') ||
-              (target instanceof HTMLInputElement && target.type === 'submit'));
-
-          // a submit button is only ok for a plain search form
-          if (
-            submitsForm &&
-            (!SEARCH_LABEL.test(label) ||
-              form.method.toLowerCase() === 'post' ||
-              form.querySelector('input[type="password"]'))
-          ) {
-            sendResponse({
-              success: false,
-              error: 'Only search buttons can submit a form',
-            });
-            return;
-          }
-
-          showCursorClick(target);
-          target.focus({ preventScroll: true });
-
-          // some sites listen for the pointer events instead of click
-          const rect = target.getBoundingClientRect();
-          const point = {
-            bubbles: true,
-            cancelable: true,
-            clientX: rect.left + rect.width / 2,
-            clientY: rect.top + rect.height / 2,
-          };
-          target.dispatchEvent(new PointerEvent('pointerdown', point));
-          target.dispatchEvent(new MouseEvent('mousedown', point));
-          target.dispatchEvent(new PointerEvent('pointerup', point));
-          target.dispatchEvent(new MouseEvent('mouseup', point));
-          target.click();
-
-          sendResponse({ success: true });
-          return;
-        }
-
-        if (
-          message.type === 'HIGHLIGHT_ELEMENT' &&
-          typeof message.elementId === 'number'
-        ) {
-          const target =
-            message.expectedText === undefined
-              ? elementById.get(message.elementId)
-              : checkedTarget(message.elementId, message.expectedText);
-
-          if (!target || !target.isConnected) {
-            sendResponse({ success: false });
-            return;
-          }
-
-          // only scroll when needed: many sites close open menus on scroll
-          const rect = target.getBoundingClientRect();
-          const inView =
-            rect.top >= 0 &&
-            rect.left >= 0 &&
-            rect.bottom <= window.innerHeight &&
-            rect.right <= window.innerWidth;
-
-          if (!inView) {
-            target.scrollIntoView({
-              behavior: 'smooth',
-              block: 'center',
-            });
-          }
-
-          target.style.outline = '4px solid #14b8a6';
-          target.style.outlineOffset = '3px';
-
-          moveCursorTo(target);
-
-          sendResponse({ success: true });
-          return;
-        }
-
-        if (
-          message.type === 'CLICK_SELECTED_LINK' &&
-          typeof message.elementId === 'number'
-        ) {
-          const target = elementById.get(
-            message.elementId
-          );
-
-          if (
-            !(target instanceof HTMLAnchorElement) ||
-            !target.isConnected
-          ) {
-            sendResponse({
-              success: false,
-              error: 'Invalid link',
-            });
-            return;
-          }
-
-          if (
-            !['http:', 'https:'].includes(target.protocol)
-          ) {
-            sendResponse({
-              success: false,
-              error: 'Unsupported URL',
-            });
-            return;
-          }
-
-          if (message.confirmed !== true) {
-            sendResponse({
-              success: false,
-              error: 'Confirmation required',
-            });
-            return;
-          }
-
-          if (
-            typeof message.expectedHref !== 'string' ||
-            target.href !== message.expectedHref
-          ) {
-            sendResponse({
-              success: false,
-              error: 'Link destination changed',
-            });
-            return;
-          }
-
-          sendResponse({ success: true });
-
-          setTimeout(() => {
-            if (
-              target.isConnected &&
-              target.href === message.expectedHref
-            ) {
-              target.click();
-            }
-          }, 100);
-
-          return;
-        }
-
-        // old text-only fill, keeping it around for now
-        if (
-          message.type === 'FILL_TEXT_INPUT' &&
-          typeof message.elementId === 'number' &&
-          typeof message.value === 'string'
-        ) {
-          const target = elementById.get(
-            message.elementId
-          );
-
-          if (
-            !(target instanceof HTMLInputElement) ||
-            target.type !== 'text' ||
-            target.disabled ||
-            target.readOnly ||
-            !target.isConnected ||
-            message.value.length > 200
-          ) {
-            sendResponse({
-              success: false,
-              error: 'Invalid text field',
-            });
-            return;
-          }
-
-          if (message.confirmed !== true) {
-            sendResponse({
-              success: false,
-              error: 'Confirmation required',
-            });
-            return;
-          }
-
-          const setter =
-            Object.getOwnPropertyDescriptor(
-              HTMLInputElement.prototype,
-              'value'
-            )?.set;
-
-          if (!setter) {
-            sendResponse({
-              success: false,
-              error: 'Cannot update field',
-            });
-            return;
-          }
-
-          setter.call(target, message.value);
-
-          target.dispatchEvent(
-            new Event('input', { bubbles: true })
-          );
-
-          target.dispatchEvent(
-            new Event('change', { bubbles: true })
-          );
-
-          sendResponse({ success: true });
-          return;
-        }
-
-        // handles text fields, checkboxes, radios and selects
-        if (message.type === 'SET_FORM_CONTROL') {
-          const elementId = message.elementId;
-          const value = message.value;
-
-          if (
-            message.confirmed !== true ||
-            !Number.isInteger(elementId)
-          ) {
-            sendResponse({
-              success: false,
-              error: 'Invalid or unconfirmed action',
-            });
-            return;
-          }
-
-          const target =
-            message.expectedText === undefined
-              ? elementById.get(elementId)
-              : checkedTarget(elementId, message.expectedText);
-
-          if (!target || !target.isConnected) {
-            sendResponse({
-              success: false,
-              error: 'Element no longer exists',
-            });
-            return;
-          }
-
-          // checkbox / radio
-          if (
-            target instanceof HTMLInputElement &&
-            ['checkbox', 'radio'].includes(target.type)
-          ) {
-            if (
-              target.disabled ||
-              typeof value !== 'boolean' ||
-              (target.type === 'radio' && value !== true)
-            ) {
-              sendResponse({
-                success: false,
-                error: 'Invalid selection',
-              });
-              return;
-            }
-
-            showCursorClick(target);
-
-            if (target.checked !== value) {
-              target.click();
-            }
-
-            const success = target.checked === value;
-
-            sendResponse({
-              success,
-              error: success
-                ? undefined
-                : 'Selection failed',
-            });
-            return;
-          }
-
-          // text inputs + textareas
-          if (
-            target instanceof HTMLInputElement ||
-            target instanceof HTMLTextAreaElement
-          ) {
-            const isInput =
-              target instanceof HTMLInputElement;
-
-            const allowedTypes = [
-              'text',
-              'email',
-              'tel',
-              'url',
-              'search',
-              'number',
-              'date',
-              'time',
-              'datetime-local',
-              'month',
-              'week',
-            ];
-
-            if (target.readOnly || target.disabled) {
-              sendResponse({
-                success: false,
-                error: target.readOnly
-                  ? 'the field is read-only, it is probably filled by a picker or menu instead'
-                  : 'the field is disabled',
-              });
-              return;
-            }
-
-            if (
-              (isInput &&
-                !allowedTypes.includes(target.type)) ||
-              typeof value !== 'string' ||
-              value.length > 1000
-            ) {
-              sendResponse({
-                success: false,
-                error: 'Invalid text field',
-              });
-              return;
-            }
-
-            const prototype = isInput
-              ? HTMLInputElement.prototype
-              : HTMLTextAreaElement.prototype;
-
-            const setter =
-              Object.getOwnPropertyDescriptor(
-                prototype,
-                'value'
-              )?.set;
-
-            if (!setter) {
-              sendResponse({
-                success: false,
-                error: 'Cannot update field',
-              });
-              return;
-            }
-
-            showCursorClick(target);
-
-            // agent mode types character by character so the user can see it
-            // and so search suggestions react like they would to a person
-            if (message.typeOut === true && value.length <= 80) {
-              const field = target;
-              field.focus({ preventScroll: true });
-              setter.call(field, '');
-              field.dispatchEvent(new Event('input', { bubbles: true }));
-
-              void (async () => {
-                // some search boxes open a popup with their own input as soon
-                // as you start typing. keep typing wherever the focus went
-                let into: HTMLInputElement | HTMLTextAreaElement = field;
-
-                for (const char of value) {
-                  const active = document.activeElement;
-
-                  if (
-                    active !== into &&
-                    active instanceof HTMLInputElement &&
-                    ['text', 'search'].includes(active.type) &&
-                    !PERSONAL_FIELD.test(describeElement(active).text)
-                  ) {
-                    into = active;
-                  }
-
-                  if (!into.isConnected) break;
-
-                  const intoSetter = Object.getOwnPropertyDescriptor(
-                    Object.getPrototypeOf(into),
-                    'value'
-                  )?.set;
-                  intoSetter?.call(into, into.value + char);
-                  into.dispatchEvent(
-                    new InputEvent('input', {
-                      bubbles: true,
-                      inputType: 'insertText',
-                      data: char,
-                    })
-                  );
-                  await new Promise((resolve) => setTimeout(resolve, 45));
-                }
-
-                into.dispatchEvent(new Event('change', { bubbles: true }));
-
-                // let the site react, then read back whichever field holds
-                // the text now (some sites move it into a popup afterwards)
-                await new Promise((resolve) => setTimeout(resolve, 300));
-
-                const active = document.activeElement;
-                if (
-                  !into.value.toLowerCase().startsWith(value.toLowerCase()) &&
-                  active instanceof HTMLInputElement &&
-                  ['text', 'search'].includes(active.type) &&
-                  !PERSONAL_FIELD.test(describeElement(active).text)
-                ) {
-                  into = active;
-                }
-
-                const typed = into.value;
-                const success = typed.toLowerCase().startsWith(value.toLowerCase());
-
-                sendResponse({
-                  success,
-                  error: success ? undefined : 'Invalid field value',
-                  value: typed,
-                  movedTo: into === field ? undefined : describeElement(into).text,
-                });
-              })();
-
-              // tells chrome we'll answer after the typing finishes
-              return true;
-            }
-
-            setter.call(target, value);
-
-            if (target.value !== value) {
-              sendResponse({
-                success: false,
-                error: 'Invalid field value',
-              });
-              return;
-            }
-
-            target.dispatchEvent(
-              new Event('input', { bubbles: true })
-            );
-
-            target.dispatchEvent(
-              new Event('change', { bubbles: true })
-            );
-
-            sendResponse({ success: true });
-            return;
-          }
-
-          // selects
-          if (target instanceof HTMLSelectElement) {
-            if (
-              target.disabled ||
-              target.multiple ||
-              typeof value !== 'string'
-            ) {
-              sendResponse({
-                success: false,
-                error: 'Invalid dropdown',
-              });
-              return;
-            }
-
-            const option = Array.from(
-              target.options
-            ).find(
-              (option) =>
-                !option.disabled &&
-                (
-                  option.value === value ||
-                  option.text.trim().toLowerCase() ===
-                    value.toLowerCase()
-                )
-            );
-
-            if (!option) {
-              sendResponse({
-                success: false,
-                error: 'Option not found',
-              });
-              return;
-            }
-
-            const setter =
-              Object.getOwnPropertyDescriptor(
-                HTMLSelectElement.prototype,
-                'value'
-              )?.set;
-
-            if (!setter) {
-              sendResponse({
-                success: false,
-                error: 'Cannot update dropdown',
-              });
-              return;
-            }
-
-            showCursorClick(target);
-            setter.call(target, option.value);
-
-            target.dispatchEvent(
-              new Event('input', { bubbles: true })
-            );
-
-            target.dispatchEvent(
-              new Event('change', { bubbles: true })
-            );
-
-            const success =
-              target.value === option.value;
-
-            sendResponse({
-              success,
-              error: success
-                ? undefined
-                : 'Dropdown update failed',
-            });
-            return;
-          }
-
-          sendResponse({
-            success: false,
-            error: 'Unsupported control',
-          });
-          return;
-        }
-
-        // page text is untrusted data. nothing sends it to the backend yet
-        if (message.type === 'GET_PAGE_CONTENT') {
-          sendResponse(getPageContent());
-          return;
-        }
-
-        // read back one control so the agent can verify its own change.
-        // stays in the extension, never sent to the backend
-        if (
-          message.type === 'GET_CONTROL_STATE' &&
-          typeof message.elementId === 'number'
-        ) {
-          const target = elementById.get(message.elementId);
-
-          if (!target || !target.isConnected) {
-            sendResponse({ success: false });
-            return;
-          }
-
-          if (
-            target instanceof HTMLInputElement &&
-            ['checkbox', 'radio'].includes(target.type)
-          ) {
-            sendResponse({ success: true, checked: target.checked });
-            return;
-          }
-
-          if (
-            (target instanceof HTMLInputElement &&
-              target.type !== 'password') ||
-            target instanceof HTMLTextAreaElement
-          ) {
-            sendResponse({ success: true, value: target.value });
-            return;
-          }
-
-          if (target instanceof HTMLSelectElement) {
-            sendResponse({
-              success: true,
-              value: target.value,
-              text: target.selectedOptions[0]?.text.trim() ?? '',
-            });
-            return;
-          }
-
-          sendResponse({ success: false });
-          return;
-        }
+    // scroll whatever scrolls under the middle of the screen (many sites scroll
+    // an inner panel, not the page). value: screens to move, or 'top'/'bottom'
+    function scroll(message: Message) {
+      const scrolls = (el: Element) => el.scrollHeight > el.clientHeight + 20 && /auto|scroll/.test(getComputedStyle(el).overflowY);
+      let box = document.elementFromPoint(innerWidth / 2, innerHeight / 2);
+      // stop at <body>: its scrolling belongs to the page itself
+      while (box && box !== document.body && !scrolls(box)) box = box.parentElement;
+      if (box === document.body) box = null;
+      // nothing scrollable in the middle: the page itself, or else its biggest scrolling panel
+      const page = document.scrollingElement ?? document.documentElement;
+      const biggest = () => [...document.querySelectorAll('*')].filter((el) => scrolls(el) && isShown(el))
+        .sort((a, b) => b.clientWidth * b.clientHeight - a.clientWidth * a.clientHeight)[0];
+      const scroller = box ?? (page.scrollHeight > page.clientHeight + 20 ? page : biggest() ?? page);
+      const behavior = reduceMotion() ? 'auto' : 'smooth';
+      if (message.value === 'top' || message.value === 'bottom') {
+        scroller.scrollTo({ top: message.value === 'top' ? 0 : scroller.scrollHeight, behavior });
+      } else {
+        scroller.scrollBy({ top: Number(message.value) * scroller.clientHeight, behavior });
       }
-    );
+      return { success: true };
+    }
+
+    const handlers: Record<string, (message: Message) => unknown> = {
+      SCROLL: scroll,
+      GET_PAGE_ELEMENTS: scanPage,
+      GET_PAGE_CONTENT: getPageContent,
+      HIGHLIGHT_ELEMENT: highlight,
+      PRESS_ELEMENT: press,
+      SET_FORM_CONTROL: setField,
+    };
+
+    // returning true keeps the channel open for answers that take a moment
+    browser.runtime.onMessage.addListener((message: Message, _sender, sendResponse) => {
+      const handler = Object.hasOwn(handlers, message.type ?? '') ? handlers[message.type!] : undefined;
+      void Promise.resolve(handler?.(message)).then(sendResponse);
+      return true;
+    });
   },
 });

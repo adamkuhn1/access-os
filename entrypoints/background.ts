@@ -1,3 +1,4 @@
 export default defineBackground(() => {
-  console.log('Hello background!', { id: browser.runtime.id });
+  // clicking the toolbar icon opens the Access OS side panel
+  void browser.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });
 });

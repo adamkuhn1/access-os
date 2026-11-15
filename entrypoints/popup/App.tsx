@@ -31,9 +31,41 @@ type PendingFormControl = {
   tabId: number;
 };
 
-const AGENT_MAX_STEPS = 5;
-const AGENT_MAX_NAVIGATIONS = 2;
+// limits for one agent run, sized for a flight search
+const AGENT_MAX_STEPS = 15;
+const AGENT_MAX_NAVIGATIONS = 3;
 const AGENT_MAX_SITE_CHANGES = 1;
+const AGENT_MAX_ANALYSES = 2;
+const AGENT_MAX_WAITS = 8;
+const AGENT_MAX_ROUNDS = 40;
+const AGENT_MAX_REJECTIONS = 3;
+
+// websites the agent may open by itself (after asking). Claude only picks an
+// ID, the URL always comes from here
+const KNOWN_SITES: Record<string, { name: string; url: string }> = {
+  google_flights: {
+    name: 'Google Flights',
+    url: 'https://www.google.com/travel/flights',
+  },
+  skyfinder_demo: {
+    name: 'SkyFinder demo site',
+    url: 'http://localhost:8123/skyfinder/',
+  },
+};
+
+const PRESSABLE_ROLES = [
+  'button', 'option', 'gridcell', 'tab', 'menuitem', 'menuitemradio',
+  'menuitemcheckbox', 'switch', 'radio', 'checkbox', 'combobox',
+];
+
+// buttons the agent must never press (checked again in the content script)
+const RISKY_PRESS =
+  /\b(buy|purchase|book|reserve|checkout|check out|pay|payment|place order|order now|subscribe|sign ?up|create account|register|log ?in|sign ?in|log ?out|sign ?out|delete|remove|send|post|share|donate|transfer|confirm|add to cart|cart)\b|select (this )?(flight|fare)/i;
+
+// spoken goals that sound like a whole task go to Agent Mode, everything
+// else stays a single-action command
+const AGENT_VOICE_GOAL =
+  /^(agent\b|find\b|search\b|look (up|for)\b|compare\b|get me\b|show me the cheapest\b|plan\b)|\bcheapest\b/i;
 
 // plain http is only allowed for other sites when they're local dev servers
 const LOCAL_HOST = /^(localhost|127\.0\.0\.1|\[::1\])$|\.localhost$/;
@@ -51,11 +83,23 @@ const sleep = (ms: number) =>
   new Promise((resolve) => setTimeout(resolve, ms));
 
 type AgentHistoryStep = {
-  action: 'set' | 'click';
+  action: 'set' | 'click' | 'press' | 'open_site' | 'analyze';
   elementId: number;
   text: string;
   value: string | boolean;
   success: true;
+};
+
+const BEST_LABELS: Record<string, string> = {
+  airline: 'Airline',
+  from: 'From',
+  to: 'To',
+  date: 'Date',
+  time: 'Time',
+  price: 'Price',
+  tripType: 'Trip type',
+  stops: 'Stops',
+  limits: 'Fare limits',
 };
 
 type AgentPreview = {
@@ -131,7 +175,14 @@ function App({ inSidePanel = false }: { inSidePanel?: boolean }) {
     answer: string;
     evidence: string[];
     truncated: boolean;
+    best?: Record<string, string>;
+    sourceUrl?: string;
   } | null>(null);
+  const [useDemoSite, setUseDemoSite] = useState(false);
+
+  // true while we're speaking, so the mic doesn't take our own voice as a command
+  const speakingRef = useRef(false);
+  const lastSpokenRef = useRef('');
   const approvalResolveRef = useRef<((approved: boolean) => void) | null>(
     null
   );
@@ -151,6 +202,8 @@ function App({ inSidePanel = false }: { inSidePanel?: boolean }) {
     selectedLink,
     confirmForm: handleConfirmForm,
     confirmNavigation: handleConfirmNavigation,
+    runAgent: handleRunAgent,
+    stopAgent,
   });
 
   useEffect(() => {
@@ -159,6 +212,8 @@ function App({ inSidePanel = false }: { inSidePanel?: boolean }) {
       selectedLink,
       confirmForm: handleConfirmForm,
       confirmNavigation: handleConfirmNavigation,
+      runAgent: handleRunAgent,
+      stopAgent,
     };
   });
 
@@ -405,6 +460,45 @@ function App({ inSidePanel = false }: { inSidePanel?: boolean }) {
     }
   }
 
+  // spoken feedback with the browser's built-in voice, only in voice mode
+  function say(text: string) {
+    if (!text || !voiceActiveRef.current || !('speechSynthesis' in window)) {
+      return;
+    }
+
+    window.speechSynthesis.cancel();
+
+    const utterance = new SpeechSynthesisUtterance(text.slice(0, 400));
+    speakingRef.current = true;
+    lastSpokenRef.current = text.toLowerCase();
+
+    // keep ignoring the mic a moment longer, the echo arrives late
+    let finished = false;
+    const done = () => {
+      if (finished) return;
+      finished = true;
+      setTimeout(() => {
+        speakingRef.current = false;
+      }, 700);
+    };
+
+    utterance.onend = done;
+    utterance.onerror = done;
+    // in case the browser never reports the end
+    setTimeout(done, 2000 + text.length * 80);
+
+    window.speechSynthesis.speak(utterance);
+  }
+
+  function stopAgent() {
+    agentStopRef.current = true;
+    setAgentProgress('Stopping...');
+    // also end a pending approval or request right away
+    approvalResolveRef.current?.(false);
+    agentAbortRef.current?.abort();
+    if ('speechSynthesis' in window) window.speechSynthesis.cancel();
+  }
+
   function stopVoice() {
     voiceActiveRef.current = false;
 
@@ -535,6 +629,14 @@ function App({ inSidePanel = false }: { inSidePanel?: boolean }) {
 
         const actions = latestActionsRef.current;
 
+        // don't treat our own spoken feedback as a new command
+        if (
+          speakingRef.current ||
+          (spoken.length > 12 && lastSpokenRef.current.includes(spoken))
+        ) {
+          continue;
+        }
+
         console.log('Voice command:', transcript);
 
         if (
@@ -546,6 +648,30 @@ function App({ inSidePanel = false }: { inSidePanel?: boolean }) {
         ) {
           stopVoice();
           return;
+        }
+
+        // while the agent runs, voice only answers its prompts or stops it
+        if (agentRunningRef.current) {
+          if (['stop', 'stop agent', 'stop the agent', 'cancel task'].includes(spoken)) {
+            actions.stopAgent();
+            setStatus('Agent stopped by voice.');
+            continue;
+          }
+
+          if (approvalResolveRef.current) {
+            if (['yes', 'yes please', 'allow', 'confirm', 'go ahead', 'share', 'ok', 'okay'].includes(spoken)) {
+              approvalResolveRef.current(true);
+              continue;
+            }
+
+            if (['no', 'no thanks', 'cancel', 'deny', "don't share", 'do not share'].includes(spoken)) {
+              approvalResolveRef.current(false);
+              continue;
+            }
+          }
+
+          setStatus('The agent is working. Say "stop" to cancel it.');
+          continue;
         }
 
         if (
@@ -568,6 +694,17 @@ function App({ inSidePanel = false }: { inSidePanel?: boolean }) {
           setPendingForm(null);
           setSelectedLink(null);
           setStatus('Action canceled.');
+          continue;
+        }
+
+        // a whole task ("find me the cheapest flight...") starts Agent Mode
+        if (AGENT_VOICE_GOAL.test(spoken)) {
+          const goalText = transcript.replace(/^agent[,:]?\s*/i, '');
+          setAgentGoal(goalText);
+          setSelectedLink(null);
+          setPendingForm(null);
+          setStatus('Starting Agent Mode from your voice command.');
+          void actions.runAgent(goalText);
           continue;
         }
 
@@ -738,11 +875,15 @@ function App({ inSidePanel = false }: { inSidePanel?: boolean }) {
         throw new Error('No active tab found');
       }
 
-      const pageData = await browser.tabs.sendMessage(tab.id, {
-        type: 'GET_PAGE_ELEMENTS',
-      });
+      // blank tabs and browser pages have nothing to scan
+      let elements: PageElement[] = [];
 
-      const elements = pageData.elements as PageElement[];
+      if (/^https?:\/\//i.test(tab.url ?? '')) {
+        const pageData = await browser.tabs.sendMessage(tab.id, {
+          type: 'GET_PAGE_ELEMENTS',
+        });
+        elements = pageData.elements as PageElement[];
+      }
 
       const response = await fetch(
         'http://127.0.0.1:3001/agent/next',
@@ -754,6 +895,13 @@ function App({ inSidePanel = false }: { inSidePanel?: boolean }) {
             url: tab.url ?? '',
             elements,
             history: [],
+            sites: useDemoSite ? ['skyfinder_demo'] : ['google_flights'],
+            today: new Date().toLocaleDateString('en-US', {
+              weekday: 'long',
+              year: 'numeric',
+              month: 'long',
+              day: 'numeric',
+            }),
           }),
         }
       );
@@ -778,7 +926,7 @@ function App({ inSidePanel = false }: { inSidePanel?: boolean }) {
 
       setAgentPreview({
         action: result.action,
-        target: target?.text,
+        target: result.action === 'open_site' ? result.site : target?.text,
         value,
         message: result.message || '',
       });
@@ -797,12 +945,14 @@ function App({ inSidePanel = false }: { inSidePanel?: boolean }) {
     }
   }
 
-  // runs set actions and same-site link navigation in one tab, until Claude
-  // says done/ask/none, something fails, the user stops it, or we hit the limit
-  async function handleRunAgent() {
+  // the agent loop: scans the page, asks Claude for one next step, checks it,
+  // shows it with the cursor, does it, verifies it, and repeats. ends when
+  // Claude says done/ask/none, an answer is found, something fails, the user
+  // stops it, or a limit is hit
+  async function handleRunAgent(goalText = agentGoal) {
     if (agentRunningRef.current || agentLoading) return;
 
-    const goal = agentGoal.trim();
+    const goal = goalText.trim();
 
     if (!goal) {
       setAgentResult('Please enter a goal first.');
@@ -819,7 +969,15 @@ function App({ inSidePanel = false }: { inSidePanel?: boolean }) {
     setAgentProgress('Starting...');
 
     const history: AgentHistoryStep[] = [];
+    const enabledSites = useDemoSite ? ['skyfinder_demo'] : ['google_flights'];
+    const today = new Date().toLocaleDateString('en-US', {
+      weekday: 'long',
+      year: 'numeric',
+      month: 'long',
+      day: 'numeric',
+    });
     let finalMessage = '';
+    let spokenAnswer = '';
 
     try {
       const [tab] = await browser.tabs.query({
@@ -827,16 +985,23 @@ function App({ inSidePanel = false }: { inSidePanel?: boolean }) {
         currentWindow: true,
       });
 
-      if (!tab?.id || !tab.url) {
+      if (!tab?.id) {
         throw new Error('No active tab found.');
       }
 
       const tabId = tab.id;
 
-      // the page we expect to be on. only changes when the agent itself navigates
-      let expectedUrl = tab.url;
+      // the page we expect to be on. only changes when the agent itself
+      // navigates. blank tabs and browser pages have no readable URL ('')
+      let expectedUrl = tab.url ?? '';
       let navigations = 0;
       let siteChanges = 0;
+      let waits = 0;
+      let analyses = 0;
+      // Claude's answer can be rejected by the backend's checks (like picking
+      // a control that can't be pressed). it gets a few chances to pick again
+      let rejections = 0;
+      let lastError = '';
 
       const checkActiveTab = async () => {
         if (agentStopRef.current) throw new Error('Stopped by user.');
@@ -859,45 +1024,170 @@ function App({ inSidePanel = false }: { inSidePanel?: boolean }) {
       const checkStillOk = async () => {
         const current = await checkActiveTab();
 
-        if (current.url !== expectedUrl) {
+        if ((current.url ?? '') !== expectedUrl) {
           throw new Error('The tab or page changed, so the agent stopped.');
         }
       };
 
+      // wait for a new page and its content script, bounded by a timeout
+      const waitForPage = async (previousUrl: string) => {
+        setAgentProgress('Waiting for the page to load...');
+        const deadline = Date.now() + PAGE_LOAD_TIMEOUT;
+
+        while (Date.now() < deadline) {
+          await sleep(250);
+          const current = await checkActiveTab();
+
+          if (
+            current.status !== 'complete' ||
+            !current.url ||
+            current.url === previousUrl
+          ) {
+            continue;
+          }
+
+          try {
+            await browser.tabs.sendMessage(tabId, { type: 'GET_PAGE_ELEMENTS' });
+            return current.url;
+          } catch {
+            // content script isn't ready yet
+          }
+        }
+
+        throw new Error('The page took too long to load. Stopped.');
+      };
+
+      // asks the user before going to another website. resolves true/false,
+      // or throws if they pressed Stop
+      const askToOpen = async (label: string, destination: URL) => {
+        const allowed = await new Promise<boolean>((resolve) => {
+          approvalResolveRef.current = resolve;
+          setNavApproval({
+            label,
+            url: destination.href,
+            origin: destination.origin,
+          });
+          say(`I'd like to open ${label}. Say yes to allow, or no to cancel.`);
+        });
+
+        approvalResolveRef.current = null;
+        setNavApproval(null);
+
+        if (agentStopRef.current) throw new Error('Stopped by user.');
+        return allowed;
+      };
+
+      // our own press or typing can change the URL (a search running, or a
+      // single-page app updating its address). same site is fine, anything
+      // else stops the run
+      const adoptUrlChange = async () => {
+        await sleep(800);
+        const current = await checkActiveTab();
+        const nowUrl = current.url ?? '';
+
+        if (nowUrl === expectedUrl && current.status === 'complete') return;
+
+        const loadedUrl =
+          current.status === 'complete' && nowUrl
+            ? nowUrl
+            : await waitForPage(expectedUrl);
+
+        const before = new URL(expectedUrl);
+        const after = new URL(loadedUrl);
+
+        if (after.origin !== before.origin) {
+          throw new Error(
+            `The page unexpectedly went to another website (${after.host}), so the agent stopped.`
+          );
+        }
+
+        if (after.pathname !== before.pathname) {
+          if (navigations >= AGENT_MAX_NAVIGATIONS) {
+            throw new Error(
+              `Stopped at the ${AGENT_MAX_NAVIGATIONS}-page navigation limit.`
+            );
+          }
+          navigations++;
+          setAgentSteps((steps) => [...steps, `Page changed → ${after.pathname}`]);
+        }
+
+        expectedUrl = loadedUrl;
+      };
+
       for (let step = 1; ; step++) {
+        if (step > AGENT_MAX_ROUNDS) {
+          throw new Error('The agent took too many rounds without finishing. Stopped.');
+        }
+
         if (history.length >= AGENT_MAX_STEPS) {
           finalMessage = `Stopped at the ${AGENT_MAX_STEPS}-step safety limit. Check the rest yourself.`;
           break;
         }
 
         await checkStillOk();
-        setAgentProgress(`Step ${step}: scanning the page...`);
 
-        const pageData = await browser.tabs.sendMessage(tabId, {
-          type: 'GET_PAGE_ELEMENTS',
-        });
-        await checkStillOk();
+        // blank tabs and browser pages have no content script, so there's
+        // nothing to scan. the agent can still open an allowed website
+        let elements: PageElement[] = [];
 
-        const elements = pageData.elements as PageElement[];
+        if (/^https?:\/\//i.test(expectedUrl)) {
+          setAgentProgress(`Step ${step}: scanning the page...`);
+
+          const pageData = await browser.tabs.sendMessage(tabId, {
+            type: 'GET_PAGE_ELEMENTS',
+          });
+          await checkStillOk();
+
+          // results still loading? wait instead of asking Claude
+          if (pageData.busy && waits < AGENT_MAX_WAITS) {
+            waits++;
+            setAgentProgress(`Step ${step}: waiting for the page to finish loading...`);
+            await sleep(1500);
+            continue;
+          }
+
+          elements = pageData.elements as PageElement[];
+        }
 
         setAgentProgress(`Step ${step}: asking Claude what to do next...`);
+
+        agentAbortRef.current = new AbortController();
 
         const response = await fetch(
           'http://127.0.0.1:3001/agent/next',
           {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
+            signal: agentAbortRef.current.signal,
             body: JSON.stringify({
               goal,
               url: expectedUrl,
               elements,
               history,
+              sites: enabledSites,
+              today,
+              lastError,
             }),
           }
         );
 
         const result = await response.json();
+        agentAbortRef.current = null;
         await checkStillOk();
+
+        // 422: the backend rejected Claude's choice. 502: Claude gave no
+        // usable answer. either way, ask again a limited number of times
+        if (
+          (response.status === 422 || response.status === 502) &&
+          rejections < AGENT_MAX_REJECTIONS
+        ) {
+          rejections++;
+          lastError = result.error || 'invalid step';
+          setAgentProgress(`Step ${step}: Claude's choice was rejected (${lastError}), asking again...`);
+          continue;
+        }
+
+        lastError = '';
 
         if (!response.ok) {
           throw new Error(result.error || `Backend error: ${response.status}`);
@@ -918,8 +1208,83 @@ function App({ inSidePanel = false }: { inSidePanel?: boolean }) {
           break;
         }
 
+        if (result.action === 'wait') {
+          if (waits >= AGENT_MAX_WAITS) {
+            throw new Error('The page kept loading for too long. Stopped.');
+          }
+
+          waits++;
+          setAgentProgress(`Step ${step}: waiting - ${result.message}`);
+          await sleep(2000);
+          continue;
+        }
+
+        // open a website from the allowlist. Claude only picks the ID; the
+        // URL comes from KNOWN_SITES here
+        if (result.action === 'open_site') {
+          const site = KNOWN_SITES[result.site as string];
+
+          if (!site || !enabledSites.includes(result.site)) {
+            throw new Error('Claude picked a website that is not allowed. Stopped.');
+          }
+
+          if (siteChanges >= AGENT_MAX_SITE_CHANGES) {
+            throw new Error('The agent can only change websites once per run. Stopped.');
+          }
+
+          if (navigations >= AGENT_MAX_NAVIGATIONS) {
+            throw new Error(
+              `Stopped at the ${AGENT_MAX_NAVIGATIONS}-page navigation limit.`
+            );
+          }
+
+          const destination = new URL(site.url);
+
+          setAgentProgress(`Step ${step}: waiting for you to allow opening ${site.name}...`);
+
+          if (!(await askToOpen(site.name, destination))) {
+            finalMessage = `Canceled: the agent did not open ${site.name}.`;
+            break;
+          }
+
+          await checkStillOk();
+
+          const previousUrl = expectedUrl;
+          await browser.tabs.update(tabId, { url: destination.href });
+          const loadedUrl = await waitForPage(previousUrl);
+
+          if (new URL(loadedUrl).origin !== destination.origin) {
+            throw new Error(
+              `${site.name} redirected to an unexpected website (${new URL(loadedUrl).host}), so the agent stopped.`
+            );
+          }
+
+          expectedUrl = loadedUrl;
+          navigations++;
+          siteChanges++;
+
+          history.push({
+            action: 'open_site',
+            elementId: 0,
+            text: site.name,
+            value: loadedUrl,
+            success: true,
+          });
+
+          setAgentSteps((steps) => [
+            ...steps,
+            `Opened ${site.name} (approved by you)`,
+          ]);
+
+          continue;
+        }
+
         // read-only: get the page text, ask before sharing it, then answer
         if (result.action === 'analyze') {
+          if (analyses >= AGENT_MAX_ANALYSES) {
+            throw new Error('The agent already read the page twice without an answer. Stopped.');
+          }
+
           setAgentProgress(`Step ${step}: reading the page...`);
 
           const page = await browser.tabs.sendMessage(tabId, {
@@ -943,6 +1308,9 @@ function App({ inSidePanel = false }: { inSidePanel?: boolean }) {
               length: page.content.length,
               truncated: page.truncated,
             });
+            say(
+              'I need to read this page to answer. Can I share its text with Claude? Say yes or no.'
+            );
           });
 
           approvalResolveRef.current = null;
@@ -975,6 +1343,8 @@ function App({ inSidePanel = false }: { inSidePanel?: boolean }) {
                 url: page.url,
                 content: page.content,
                 truncated: page.truncated,
+                mode: 'agent',
+                today,
               }),
             }
           );
@@ -989,21 +1359,48 @@ function App({ inSidePanel = false }: { inSidePanel?: boolean }) {
             );
           }
 
+          analyses++;
+
+          // no results yet: note it for Claude and keep going
+          if (analysis.status === 'not_ready' && analyses < AGENT_MAX_ANALYSES) {
+            history.push({
+              action: 'analyze',
+              elementId: 0,
+              text: 'Read the page',
+              value: `Results weren't ready: ${analysis.answer}`,
+              success: true,
+            });
+            setAgentSteps((steps) => [
+              ...steps,
+              'Read the page: no results yet, continuing',
+            ]);
+            continue;
+          }
+
           setAgentAnswer({
             answer: analysis.answer,
             evidence: analysis.evidence ?? [],
             truncated: page.truncated,
+            best: analysis.best,
+            sourceUrl: page.url,
           });
 
           setAgentSteps((steps) => [...steps, 'Read the page and answered']);
+          spokenAnswer = analysis.answer;
 
-          finalMessage = page.truncated
-            ? 'Done, but the page was long and only part of it was read, so the answer may be incomplete.'
-            : 'Done: answered from this page.';
+          if (analysis.status === 'needs_user') {
+            finalMessage = 'Claude needs your input to continue (see the answer above).';
+          } else if (analysis.status === 'not_ready') {
+            finalMessage = 'Stopped: the page still had no usable results.';
+          } else {
+            finalMessage = page.truncated
+              ? 'Done, but the page was long and only part of it was read, so the answer may be incomplete.'
+              : 'Done: answered from this page.';
+          }
           break;
         }
 
-        if (result.action !== 'set' && result.action !== 'click') {
+        if (!['set', 'click', 'press'].includes(result.action)) {
           throw new Error('Claude returned an unsupported action. Stopped.');
         }
 
@@ -1013,6 +1410,66 @@ function App({ inSidePanel = false }: { inSidePanel?: boolean }) {
 
         if (!target) {
           throw new Error('Claude picked an element that is not on the page.');
+        }
+
+        // buttons, options, tabs and date cells. checked here, again in the
+        // content script right before the click
+        if (result.action === 'press') {
+          // clicking a plain text or date field is fine too (it often opens a picker)
+          const clickableField =
+            target.role === 'input' &&
+            ['text', 'search', 'date'].includes(target.inputType ?? '');
+
+          if (!PRESSABLE_ROLES.includes(target.role) && !clickableField) {
+            throw new Error(`"${target.text}" isn't something the agent can press. Stopped.`);
+          }
+
+          if (RISKY_PRESS.test(target.text) || SENSITIVE_FIELD.test(target.text)) {
+            throw new Error(
+              `"${target.text}" looks like it could buy, book, sign in or send something, so the agent won't press it.`
+            );
+          }
+
+          setAgentProgress(`Step ${step}: pressing "${target.text}"`);
+
+          const highlight = await browser.tabs.sendMessage(tabId, {
+            type: 'HIGHLIGHT_ELEMENT',
+            elementId: target.id,
+            expectedText: target.text,
+          });
+          await checkStillOk();
+
+          if (!highlight?.success) {
+            throw new Error(`"${target.text}" changed or disappeared. Stopped.`);
+          }
+
+          await sleep(700);
+          await checkStillOk();
+
+          const pressed = await browser.tabs.sendMessage(tabId, {
+            type: 'PRESS_ELEMENT',
+            elementId: target.id,
+            expectedText: target.text,
+          });
+
+          if (!pressed?.success) {
+            throw new Error(
+              `Could not press "${target.text}": ${pressed?.error ?? 'unknown error'}. Stopped.`
+            );
+          }
+
+          history.push({
+            action: 'press',
+            elementId: target.id,
+            text: target.text,
+            value: '',
+            success: true,
+          });
+
+          setAgentSteps((steps) => [...steps, `Pressed "${target.text}"`]);
+
+          await adoptUrlChange();
+          continue;
         }
 
         if (result.action === 'click') {
@@ -1084,21 +1541,7 @@ function App({ inSidePanel = false }: { inSidePanel?: boolean }) {
               `Step ${step}: waiting for you to allow leaving this website...`
             );
 
-            const allowed = await new Promise<boolean>((resolve) => {
-              approvalResolveRef.current = resolve;
-              setNavApproval({
-                label: target.text,
-                url: destination.href,
-                origin: destination.origin,
-              });
-            });
-
-            approvalResolveRef.current = null;
-            setNavApproval(null);
-
-            if (agentStopRef.current) throw new Error('Stopped by user.');
-
-            if (!allowed) {
+            if (!(await askToOpen(target.text, destination))) {
               finalMessage = `Canceled: the agent did not open ${destination.host} and stayed on this page.`;
               break;
             }
@@ -1144,38 +1587,7 @@ function App({ inSidePanel = false }: { inSidePanel?: boolean }) {
           // navigate via the tabs API so the page's own click handlers never run
           const previousUrl = expectedUrl;
           await browser.tabs.update(tabId, { url: destination.href });
-
-          setAgentProgress(`Step ${step}: waiting for the page to load...`);
-
-          // wait for the new page and its content script, bounded by a timeout
-          const deadline = Date.now() + PAGE_LOAD_TIMEOUT;
-          let loadedUrl = '';
-
-          while (!loadedUrl) {
-            if (Date.now() > deadline) {
-              throw new Error('The next page took too long to load. Stopped.');
-            }
-
-            await sleep(250);
-            const current = await checkActiveTab();
-
-            if (
-              current.status !== 'complete' ||
-              !current.url ||
-              current.url === previousUrl
-            ) {
-              continue;
-            }
-
-            try {
-              await browser.tabs.sendMessage(tabId, {
-                type: 'GET_PAGE_ELEMENTS',
-              });
-              loadedUrl = current.url;
-            } catch {
-              // content script isn't ready yet
-            }
-          }
+          const loadedUrl = await waitForPage(previousUrl);
 
           // redirects are fine as long as we end up on the site we expected
           // (the approved one, if we just left the old site)
@@ -1222,13 +1634,20 @@ function App({ inSidePanel = false }: { inSidePanel?: boolean }) {
               : 'unchecked'
             : `"${value}"`;
 
+        // text and search boxes are typed out so the user can follow along
+        const typeOut =
+          typeof value === 'string' &&
+          (target.role === 'textarea' ||
+            ['text', 'search', ''].includes(target.inputType ?? ''));
+
         setAgentProgress(
-          `Step ${step}: setting "${target.text}" to ${shownValue}`
+          `Step ${step}: ${typeOut ? 'typing' : 'setting'} "${target.text}" ${typeOut ? '' : 'to '}${shownValue}`
         );
 
         const highlight = await browser.tabs.sendMessage(tabId, {
           type: 'HIGHLIGHT_ELEMENT',
           elementId: target.id,
+          expectedText: target.text,
         });
         await checkStillOk();
 
@@ -1240,11 +1659,13 @@ function App({ inSidePanel = false }: { inSidePanel?: boolean }) {
         await sleep(700);
         await checkStillOk();
 
-        // the user authorized form edits by pressing Run Form Task
+        // the user authorized form edits by starting the agent
         const applied = await browser.tabs.sendMessage(tabId, {
           type: 'SET_FORM_CONTROL',
           elementId: target.id,
+          expectedText: target.text,
           value,
+          typeOut,
           confirmed: true,
         });
 
@@ -1264,13 +1685,25 @@ function App({ inSidePanel = false }: { inSidePanel?: boolean }) {
 
         let verified = false;
 
-        if (state?.success) {
+        if (typeOut && applied.movedTo) {
+          // the site moved our typing into a popup field; the content script
+          // already read that field back
+          verified = String(applied.value)
+            .toLowerCase()
+            .startsWith(value.toString().toLowerCase());
+        } else if (state?.success) {
           if (typeof value === 'boolean') {
             verified = state.checked === value;
           } else if (target.role === 'select') {
             verified =
               state.value === value ||
               state.text?.toLowerCase() === value.toLowerCase();
+          } else if (typeOut) {
+            // search boxes may fill in the rest themselves ("Detroit" ->
+            // "Detroit (DTW)"), so what we typed just has to be there
+            verified = String(state.value)
+              .toLowerCase()
+              .startsWith(value.toLowerCase());
           } else {
             verified = state.value === value;
           }
@@ -1292,16 +1725,18 @@ function App({ inSidePanel = false }: { inSidePanel?: boolean }) {
 
         setAgentSteps((steps) => [
           ...steps,
-          `${target.text} → ${shownValue}`,
+          applied.movedTo
+            ? `${target.text} → ${shownValue} (typed into "${applied.movedTo}")`
+            : `${target.text} → ${shownValue}`,
         ]);
 
-        await sleep(300);
+        await adoptUrlChange();
       }
     } catch (error) {
       console.error(error);
 
       if (agentStopRef.current) {
-        // covers an aborted analyze request too
+        // covers an aborted request too
         finalMessage = 'Stopped by user.';
       } else {
         finalMessage =
@@ -1316,6 +1751,7 @@ function App({ inSidePanel = false }: { inSidePanel?: boolean }) {
       setAgentRunning(false);
       setAgentProgress('');
       setAgentResult(finalMessage);
+      say(spokenAnswer ? `${spokenAnswer} ${finalMessage}` : finalMessage);
     }
   }
 
@@ -1532,24 +1968,31 @@ function App({ inSidePanel = false }: { inSidePanel?: boolean }) {
           Run Agent
         </button>
 
+        <label>
+          <input
+            type="checkbox"
+            checked={useDemoSite}
+            onChange={(e) => setUseDemoSite(e.target.checked)}
+            disabled={agentRunning}
+          />{' '}
+          Use the local SkyFinder demo site for flight searches (fictional
+          prices) instead of Google Flights
+        </label>
+
         <p id="run-form-task-help">
-          Run Agent works toward this goal in the current tab. It can fill in
-          form fields and follow links within the same website (up to 2
-          pages). It asks you before opening a link to a different website.
-          It never clicks buttons or submits forms.
+          Run Agent works toward this goal in the current tab, even a blank
+          one. It can open a flight search site, fill in and run searches, and
+          read the results. It asks you before opening another website and
+          before sharing page text. It never books, buys, signs in, or sends
+          anything. In voice mode, just say your goal ("find me the cheapest
+          flight...") and answer its questions with "yes", "no" or "stop".
         </p>
 
         {agentRunning && (
           <>
             <button
               type="button"
-              onClick={() => {
-                agentStopRef.current = true;
-                setAgentProgress('Stopping...');
-                // also end a pending approval or analysis right away
-                approvalResolveRef.current?.(false);
-                agentAbortRef.current?.abort();
-              }}
+              onClick={stopAgent}
             >
               Stop Agent
             </button>
@@ -1575,12 +2018,12 @@ function App({ inSidePanel = false }: { inSidePanel?: boolean }) {
             <div role="group" aria-labelledby="leave-site-heading">
               <h3 id="leave-site-heading">Leave this website?</h3>
               <p>
-                The agent wants to open a link on a different website. This
-                only allows this one link, not other websites.
+                The agent wants to go to a different website. This only allows
+                this one page, not other websites.
               </p>
 
               <p>
-                <strong>Link:</strong> {navApproval.label}
+                <strong>Opening:</strong> {navApproval.label}
               </p>
 
               <p style={{ overflowWrap: 'anywhere' }}>
@@ -1648,6 +2091,26 @@ function App({ inSidePanel = false }: { inSidePanel?: boolean }) {
               <h3>Answer</h3>
               <p>{agentAnswer.answer}</p>
 
+              {agentAnswer.best && (
+                <>
+                  <h4>Best match</h4>
+                  <dl>
+                    {Object.entries(agentAnswer.best).map(([key, value]) => (
+                      <div key={key}>
+                        <dt>{BEST_LABELS[key] ?? key}</dt>
+                        <dd>{value}</dd>
+                      </div>
+                    ))}
+                  </dl>
+                </>
+              )}
+
+              {agentAnswer.sourceUrl && (
+                <p style={{ overflowWrap: 'anywhere' }}>
+                  <strong>Source:</strong> {agentAnswer.sourceUrl}
+                </p>
+              )}
+
               {agentAnswer.truncated && (
                 <p>
                   Note: only part of the page was read, so this may not cover
@@ -1684,17 +2147,20 @@ function App({ inSidePanel = false }: { inSidePanel?: boolean }) {
                 {agentPreview.action === 'none' && 'Nothing to do here'}
                 {agentPreview.action === 'analyze' &&
                   'Next step: read this page to answer'}
-                {['set', 'click'].includes(agentPreview.action) &&
+                {agentPreview.action === 'open_site' &&
+                  `Next step: open ${KNOWN_SITES[agentPreview.target ?? '']?.name ?? 'a website'} (would ask you first)`}
+                {agentPreview.action === 'wait' && 'Next step: wait for the page'}
+                {['set', 'click', 'press'].includes(agentPreview.action) &&
                   'Proposed next step (preview only)'}
               </h3>
 
-              {['set', 'click'].includes(agentPreview.action) && (
+              {['set', 'click', 'press'].includes(agentPreview.action) && (
                 <>
                   <p>
                     <strong>Action:</strong>{' '}
-                    {agentPreview.action === 'set'
-                      ? 'Change form field'
-                      : 'Open link'}
+                    {agentPreview.action === 'set' && 'Change form field'}
+                    {agentPreview.action === 'click' && 'Open link'}
+                    {agentPreview.action === 'press' && 'Press button or option'}
                   </p>
 
                   <p>

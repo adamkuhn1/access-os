@@ -155,6 +155,183 @@ export default defineContentScript({
       }, 1500);
     }
 
+    // labels for buttons/options the agent must never press on its own
+    const RISKY_PRESS =
+      /\b(buy|purchase|book|reserve|checkout|check out|pay|payment|place order|order now|subscribe|sign ?up|create account|register|log ?in|sign ?in|log ?out|sign ?out|delete|remove|send|post|share|donate|transfer|confirm|add to cart|cart)\b|select (this )?(flight|fare)/i;
+
+    // the only kind of form submit button the agent may press
+    const SEARCH_LABEL =
+      /\b(search|find|explore|show (flights|results)|update results|go)\b/i;
+
+    // fields whose current value we never report back
+    const PERSONAL_FIELD =
+      /name|e-?mail|phone|address|street|zip|postal|birth|passport|card|account|ssn|password|security/i;
+
+    const collapse = (text: string | null | undefined, max = 200) =>
+      (text ?? '').replace(/\s+/g, ' ').trim().slice(0, max);
+
+    const isShown = (element: Element) =>
+      element.checkVisibility({ checkVisibilityCSS: true });
+
+    const stateOf = (element: HTMLElement) => {
+      const states: string[] = [];
+      if (element.getAttribute('aria-expanded') === 'true') states.push('expanded');
+      if (element.getAttribute('aria-selected') === 'true') states.push('selected');
+      if (element.getAttribute('aria-pressed') === 'true') states.push('pressed');
+      if (element.getAttribute('aria-checked') === 'true') states.push('checked');
+      if (
+        element.getAttribute('aria-disabled') === 'true' ||
+        (element as HTMLButtonElement).disabled
+      ) {
+        states.push('disabled');
+      }
+      return states.length ? states.join(', ') : undefined;
+    };
+
+    // is something else (like an open dialog) drawn on top of this element?
+    // only checked for elements on screen
+    const isCovered = (element: HTMLElement) => {
+      const rect = element.getBoundingClientRect();
+      const x = rect.left + rect.width / 2;
+      const y = rect.top + rect.height / 2;
+
+      if (x < 0 || y < 0 || x > window.innerWidth || y > window.innerHeight) {
+        return false;
+      }
+
+      const top = document.elementFromPoint(x, y);
+      return !!top && !element.contains(top) && !top.contains(element);
+    };
+
+    // how the scanner describes one element. also used to re-check an element
+    // right before acting on it, so a stale ID can't hit the wrong thing
+    function describeElement(element: HTMLElement) {
+      const ariaRole = element.getAttribute('role') ?? undefined;
+      const state = stateOf(element);
+
+      if (element instanceof HTMLAnchorElement) {
+        return {
+          text: collapse(element.getAttribute('aria-label') || element.textContent),
+          role: 'link',
+          href: element.href,
+        };
+      }
+
+      if (element instanceof HTMLInputElement) {
+        if (['submit', 'button'].includes(element.type)) {
+          return {
+            text: collapse(element.getAttribute('aria-label') || element.value),
+            role: 'button',
+            state,
+          };
+        }
+
+        const isChoice = ['checkbox', 'radio'].includes(element.type);
+        const label =
+          element.getAttribute('aria-label') ||
+          element.labels?.[0]?.textContent?.trim() ||
+          (isChoice ? element.nextSibling?.textContent?.trim() : undefined) ||
+          element.placeholder ||
+          element.name ||
+          element.id;
+
+        // share what's typed in search-style fields so the agent can see its
+        // own progress, but never personal fields
+        const safeValue =
+          !isChoice &&
+          ['text', 'search', 'date', 'number', ''].includes(element.type) &&
+          !PERSONAL_FIELD.test(`${label} ${element.name} ${element.id}`) &&
+          !/name|email|tel|address|postal|bday|cc-|username/i.test(
+            element.autocomplete
+          );
+
+        return {
+          text: collapse(isChoice ? `${element.name || element.type}: ${label}` : label),
+          role: 'input',
+          inputType: element.type,
+          ariaRole,
+          state,
+          value: safeValue ? collapse(element.value, 100) : undefined,
+          choiceValue: isChoice ? element.value : undefined,
+          checked: isChoice ? element.checked : undefined,
+        };
+      }
+
+      if (element instanceof HTMLTextAreaElement) {
+        return {
+          text: collapse(
+            element.getAttribute('aria-label') ||
+              element.labels?.[0]?.textContent ||
+              element.placeholder ||
+              element.name ||
+              element.id
+          ),
+          role: 'textarea',
+        };
+      }
+
+      if (element instanceof HTMLSelectElement) {
+        return {
+          text: collapse(
+            element.getAttribute('aria-label') ||
+              element.labels?.[0]?.textContent ||
+              element.name ||
+              element.id
+          ),
+          role: 'select',
+          options: Array.from(element.options).map((option) => ({
+            text: option.text.trim(),
+            value: option.value,
+            disabled: option.disabled,
+          })),
+        };
+      }
+
+      const labelledBy = element
+        .getAttribute('aria-labelledby')
+        ?.split(/\s+/)
+        .map((id) => document.getElementById(id)?.textContent ?? '')
+        .join(' ');
+
+      // date pickers often keep the full date in an attribute ("2026-11-20")
+      const date = element.dataset.iso || element.dataset.date;
+
+      return {
+        text: collapse(
+          element.getAttribute('aria-label') || labelledBy || element.textContent
+        ),
+        role:
+          element instanceof HTMLButtonElement || !ariaRole
+            ? 'button'
+            : ariaRole,
+        state,
+        date: date && /^\d{4}-\d{2}-\d{2}$/.test(date) ? date : undefined,
+      };
+    }
+
+    // the element for this ID, only if it still looks exactly like it did in
+    // the scan the caller is acting on
+    function checkedTarget(elementId: unknown, expectedText: unknown) {
+      if (typeof elementId !== 'number') return null;
+
+      const element = elementById.get(elementId);
+
+      if (!element || !element.isConnected || !isShown(element)) return null;
+
+      // same DOM node, so a label that only grew (like a price loading in
+      // next to a date, "14????" -> "14$244") is still the same control
+      if (
+        typeof expectedText === 'string' &&
+        !describeElement(element).text.startsWith(
+          expectedText.replace(/[\s?…—-]+$/, '')
+        )
+      ) {
+        return null;
+      }
+
+      return element;
+    }
+
     // read-only text extraction. walks visible text in DOM order and puts each
     // block (div, p, li, heading...) on its own line, so text inside one
     // result card stays together. table cells in a row are joined with " | "
@@ -248,10 +425,14 @@ export default defineContentScript({
         length += line.length + 1;
       };
 
-      const walker = document.createTreeWalker(
-        document.body,
-        NodeFilter.SHOW_TEXT
-      );
+      // prefer the page's main area over menus and footers when it has one
+      const main = document.querySelector('main, [role="main"]');
+      const root =
+        main && collapse(main.textContent, 300).length >= 200
+          ? main
+          : document.body;
+
+      const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
 
       let visited = 0;
 
@@ -318,105 +499,62 @@ export default defineContentScript({
         }
 
         if (message.type === 'GET_PAGE_ELEMENTS') {
+          // form controls first, then widgets, buttons and links, so the
+          // important ones survive the backend's element limit
+          const selectors = [
+            'input:not([type="hidden"]):not([type="password"]):not([type="file"]):not([type="reset"]):not([type="image"])',
+            'textarea',
+            'select',
+            '[role="combobox"], [role="option"], [role="tab"], [role="menuitem"], [role="menuitemradio"], [role="menuitemcheckbox"], [role="switch"], [role="radio"], [role="checkbox"]',
+            'button, [role="button"]',
+            '[role="gridcell"]',
+            'a[href]',
+          ];
 
-          const links = Array.from(
-            document.querySelectorAll<HTMLAnchorElement>('a[href]')
-          ).map((link) => ({
-            element: link,
-            text:
-              link.getAttribute('aria-label') ||
-              link.textContent?.trim(),
-            role: 'link',
-            href: link.href,
-          }));
-
-          const buttons = Array.from(
-            document.querySelectorAll<HTMLButtonElement>('button')
-          ).map((button) => ({
-            element: button,
-            text:
-              button.getAttribute('aria-label') ||
-              button.textContent?.trim(),
-            role: 'button',
-          }));
-
-          const inputs = Array.from(
-            document.querySelectorAll<HTMLInputElement>(
-              'input:not([type="hidden"]):not([type="password"]):not([type="file"]):not([type="submit"]):not([type="reset"]):not([type="button"]):not([type="image"])'
-            )
-          ).map((input) => {
-            const isChoice = ['checkbox', 'radio'].includes(
-              input.type
+          // calendars can render hundreds of day cells; only the ones on
+          // screen are useful, and the rest would push out other controls
+          const onScreen = (element: Element) => {
+            const rect = element.getBoundingClientRect();
+            return (
+              rect.bottom > 0 &&
+              rect.right > 0 &&
+              rect.top < window.innerHeight &&
+              rect.left < window.innerWidth
             );
+          };
 
-            const label =
-              input.getAttribute('aria-label') ||
-              input.labels?.[0]?.textContent?.trim() ||
-              (isChoice
-                ? input.nextSibling?.textContent?.trim()
-                : undefined) ||
-              input.placeholder ||
-              input.name ||
-              input.id;
+          const seen = new Set<Element>();
+          const found: HTMLElement[] = [];
 
-            return {
-              element: input,
-              text: isChoice
-                ? `${input.name || input.type}: ${label}`
-                : label,
-              role: 'input',
-              inputType: input.type,
-              choiceValue: isChoice ? input.value : undefined,
-              checked: isChoice ? input.checked : undefined,
-            };
-          });
-
-          const textareas = Array.from(
-            document.querySelectorAll<HTMLTextAreaElement>(
-              'textarea'
-            )
-          ).map((textarea) => ({
-            element: textarea,
-            text:
-              textarea.getAttribute('aria-label') ||
-              textarea.labels?.[0]?.textContent?.trim() ||
-              textarea.placeholder ||
-              textarea.name ||
-              textarea.id,
-            role: 'textarea',
-          }));
-
-          const selects = Array.from(
-            document.querySelectorAll<HTMLSelectElement>(
-              'select'
-            )
-          ).map((select) => ({
-            element: select,
-            text:
-              select.getAttribute('aria-label') ||
-              select.labels?.[0]?.textContent?.trim() ||
-              select.name ||
-              select.id,
-            role: 'select',
-            options: Array.from(select.options).map(
-              (option) => ({
-                text: option.text.trim(),
-                value: option.value,
-                disabled: option.disabled,
-              })
-            ),
-          }));
+          for (const selector of selectors) {
+            document.querySelectorAll<HTMLElement>(selector).forEach((element) => {
+              if (seen.has(element) || cursor.contains(element)) return;
+              seen.add(element);
+              if (!isShown(element)) return;
+              if (element.getAttribute('role') === 'gridcell' && !onScreen(element)) return;
+              found.push(element);
+            });
+          }
 
           elementById.clear();
 
-          const elements = [
-            ...links,
-            ...buttons,
-            ...inputs,
-            ...textareas,
-            ...selects,
-          ]
+          // busy sites (like Google Flights) have hundreds of off-screen
+          // controls, so list what's on screen first
+          const ordered = [
+            ...found.filter(onScreen),
+            ...found.filter((element) => !onScreen(element)),
+          ];
+
+          const elements = ordered
+            .map((element) => {
+              const info = describeElement(element);
+              const state = isCovered(element)
+                ? [info.state, 'covered'].filter(Boolean).join(', ')
+                : info.state;
+              return { element, ...info, state };
+            })
             .filter((item) => item.text)
+            .slice(0, 350)
             .map(({ element, ...data }, index) => {
               const id = index + 1;
               elementById.set(id, element);
@@ -424,8 +562,95 @@ export default defineContentScript({
               return { id, ...data };
             });
 
-          console.log('Scanned elements:', elements);
-          sendResponse({ elements });
+          // a visible spinner or busy region usually means results are loading
+          const busy = Array.from(
+            document.querySelectorAll('[aria-busy="true"], [role="progressbar"]')
+          ).some(isShown);
+
+          sendResponse({ elements, busy });
+          return;
+        }
+
+        // press a button, option, tab or date cell. only after re-checking it
+        // and refusing anything that looks consequential
+        if (message.type === 'PRESS_ELEMENT') {
+          const target = checkedTarget(message.elementId, message.expectedText);
+
+          if (!target) {
+            sendResponse({
+              success: false,
+              error: 'The element changed or disappeared',
+            });
+            return;
+          }
+
+          const label = describeElement(target).text;
+
+          if (stateOf(target)?.includes('disabled')) {
+            sendResponse({ success: false, error: 'That control is disabled' });
+            return;
+          }
+
+          if (isCovered(target)) {
+            sendResponse({
+              success: false,
+              error:
+                'it is covered by a popup or dialog, close that first (for example with its Done or Close button)',
+            });
+            return;
+          }
+
+          if (RISKY_PRESS.test(label)) {
+            sendResponse({
+              success: false,
+              error: 'That looks like it could buy, book, sign in or send something',
+            });
+            return;
+          }
+
+          const form =
+            target instanceof HTMLButtonElement ||
+            target instanceof HTMLInputElement
+              ? target.form
+              : null;
+
+          const submitsForm =
+            !!form &&
+            ((target instanceof HTMLButtonElement && target.type === 'submit') ||
+              (target instanceof HTMLInputElement && target.type === 'submit'));
+
+          // a submit button is only ok for a plain search form
+          if (
+            submitsForm &&
+            (!SEARCH_LABEL.test(label) ||
+              form.method.toLowerCase() === 'post' ||
+              form.querySelector('input[type="password"]'))
+          ) {
+            sendResponse({
+              success: false,
+              error: 'Only search buttons can submit a form',
+            });
+            return;
+          }
+
+          showCursorClick(target);
+          target.focus({ preventScroll: true });
+
+          // some sites listen for the pointer events instead of click
+          const rect = target.getBoundingClientRect();
+          const point = {
+            bubbles: true,
+            cancelable: true,
+            clientX: rect.left + rect.width / 2,
+            clientY: rect.top + rect.height / 2,
+          };
+          target.dispatchEvent(new PointerEvent('pointerdown', point));
+          target.dispatchEvent(new MouseEvent('mousedown', point));
+          target.dispatchEvent(new PointerEvent('pointerup', point));
+          target.dispatchEvent(new MouseEvent('mouseup', point));
+          target.click();
+
+          sendResponse({ success: true });
           return;
         }
 
@@ -433,19 +658,30 @@ export default defineContentScript({
           message.type === 'HIGHLIGHT_ELEMENT' &&
           typeof message.elementId === 'number'
         ) {
-          const target = elementById.get(
-            message.elementId
-          );
+          const target =
+            message.expectedText === undefined
+              ? elementById.get(message.elementId)
+              : checkedTarget(message.elementId, message.expectedText);
 
           if (!target || !target.isConnected) {
             sendResponse({ success: false });
             return;
           }
 
-          target.scrollIntoView({
-            behavior: 'smooth',
-            block: 'center',
-          });
+          // only scroll when needed: many sites close open menus on scroll
+          const rect = target.getBoundingClientRect();
+          const inView =
+            rect.top >= 0 &&
+            rect.left >= 0 &&
+            rect.bottom <= window.innerHeight &&
+            rect.right <= window.innerWidth;
+
+          if (!inView) {
+            target.scrollIntoView({
+              behavior: 'smooth',
+              block: 'center',
+            });
+          }
 
           target.style.outline = '4px solid #14b8a6';
           target.style.outlineOffset = '3px';
@@ -595,7 +831,10 @@ export default defineContentScript({
             return;
           }
 
-          const target = elementById.get(elementId);
+          const target =
+            message.expectedText === undefined
+              ? elementById.get(elementId)
+              : checkedTarget(elementId, message.expectedText);
 
           if (!target || !target.isConnected) {
             sendResponse({
@@ -695,6 +934,80 @@ export default defineContentScript({
             }
 
             showCursorClick(target);
+
+            // agent mode types character by character so the user can see it
+            // and so search suggestions react like they would to a person
+            if (message.typeOut === true && value.length <= 80) {
+              const field = target;
+              field.focus({ preventScroll: true });
+              setter.call(field, '');
+              field.dispatchEvent(new Event('input', { bubbles: true }));
+
+              void (async () => {
+                // some search boxes open a popup with their own input as soon
+                // as you start typing. keep typing wherever the focus went
+                let into: HTMLInputElement | HTMLTextAreaElement = field;
+
+                for (const char of value) {
+                  const active = document.activeElement;
+
+                  if (
+                    active !== into &&
+                    active instanceof HTMLInputElement &&
+                    ['text', 'search'].includes(active.type) &&
+                    !PERSONAL_FIELD.test(describeElement(active).text)
+                  ) {
+                    into = active;
+                  }
+
+                  if (!into.isConnected) break;
+
+                  const intoSetter = Object.getOwnPropertyDescriptor(
+                    Object.getPrototypeOf(into),
+                    'value'
+                  )?.set;
+                  intoSetter?.call(into, into.value + char);
+                  into.dispatchEvent(
+                    new InputEvent('input', {
+                      bubbles: true,
+                      inputType: 'insertText',
+                      data: char,
+                    })
+                  );
+                  await new Promise((resolve) => setTimeout(resolve, 45));
+                }
+
+                into.dispatchEvent(new Event('change', { bubbles: true }));
+
+                // let the site react, then read back whichever field holds
+                // the text now (some sites move it into a popup afterwards)
+                await new Promise((resolve) => setTimeout(resolve, 300));
+
+                const active = document.activeElement;
+                if (
+                  !into.value.toLowerCase().startsWith(value.toLowerCase()) &&
+                  active instanceof HTMLInputElement &&
+                  ['text', 'search'].includes(active.type) &&
+                  !PERSONAL_FIELD.test(describeElement(active).text)
+                ) {
+                  into = active;
+                }
+
+                const typed = into.value;
+                const success = typed.toLowerCase().startsWith(value.toLowerCase());
+
+                sendResponse({
+                  success,
+                  error: success ? undefined : 'Invalid field value',
+                  value: typed,
+                  movedTo: into === field ? undefined : describeElement(into).text,
+                });
+              })();
+
+              // tells chrome we'll answer after the typing finishes
+              return true;
+            }
+
             setter.call(target, value);
 
             if (target.value !== value) {

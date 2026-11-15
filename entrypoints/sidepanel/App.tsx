@@ -24,12 +24,14 @@ type Recognizer = {
   onend: (() => void) | null;
   start: () => void;
   stop: () => void;
+  abort?: () => void;
 };
 
 export default function App() {
   const [text, setText] = useState('');
   const [status, setStatus] = useState('Tap the mic and say what you want to do, or type below.');
   const [listening, setListening] = useState(false);
+  const [muted, setMuted] = useState(false);
   const [running, setRunning] = useState(false);
   const [progress, setProgress] = useState('');
   const [steps, setSteps] = useState<string[]>([]);
@@ -37,6 +39,8 @@ export default function App() {
 
   const recognitionRef = useRef<Recognizer | null>(null);
   const listeningRef = useRef(false);
+  // demo mute: recognition is off, but we stay in voice mode so answers are still spoken
+  const mutedRef = useRef(false);
   const runningRef = useRef(false);
   const stopRef = useRef<AbortController | null>(null);
   // last thing we said, so we can ignore our own echo
@@ -63,7 +67,7 @@ export default function App() {
 
   // only speaks in voice mode
   function say(words: string) {
-    if (!words || !listeningRef.current || !('speechSynthesis' in window)) return;
+    if (!words || !(listeningRef.current || mutedRef.current) || !('speechSynthesis' in window)) return;
     speechSynthesis.cancel();
     speakingRef.current = true;
     lastSpokenRef.current = words.toLowerCase();
@@ -181,12 +185,33 @@ export default function App() {
 
   function stopListening() {
     listeningRef.current = false;
-    recognitionRef.current?.stop();
+    mutedRef.current = false;
+    setMuted(false);
+    // abort drops any result still in flight; stop() would deliver it
+    const recognition = recognitionRef.current;
     recognitionRef.current = null;
+    if (recognition?.abort) recognition.abort();
+    else recognition?.stop();
     setListening(false);
   }
 
-  function startListening() {
+  // only touches recognition, so a running task, its progress and spoken answers carry on
+  function toggleDemoMute() {
+    if (mutedRef.current) {
+      mutedRef.current = false;
+      setMuted(false);
+      // mic is already allowed (we were listening), so no permission prompt
+      startListening(!runningRef.current);
+      if (!runningRef.current) setStatus('Listening again.');
+    } else {
+      stopListening();
+      mutedRef.current = true;
+      setMuted(true);
+      if (!runningRef.current) setStatus('Mic muted for the demo. Answers are still spoken.');
+    }
+  }
+
+  function startListening(announce = true) {
     const speech = window as unknown as { SpeechRecognition?: new () => Recognizer; webkitSpeechRecognition?: new () => Recognizer };
     const Recognition = speech.SpeechRecognition || speech.webkitSpeechRecognition;
     if (!Recognition) return setStatus('Speech recognition is not supported in this browser.');
@@ -197,19 +222,22 @@ export default function App() {
     recognition.interimResults = false;
 
     recognition.onresult = (event) => {
+      // ignore results from a recognizer that was stopped or muted
+      if (recognitionRef.current !== recognition || !listeningRef.current) return;
       for (let i = event.resultIndex; i < event.results.length; i++) {
         const result = event.results[i];
         if (result?.isFinal && result[0].transcript.trim()) handleSpeech(result[0].transcript.trim());
       }
     };
     recognition.onerror = (event) => {
-      if (!listeningRef.current || event.error === 'no-speech') return; // Chrome fires no-speech a lot
+      if (recognitionRef.current !== recognition || !listeningRef.current || event.error === 'no-speech') return; // Chrome fires no-speech a lot
       stopListening();
       setStatus(MIC_ERRORS[event.error] ?? `Speech recognition error: ${event.error}`);
     };
     // Chrome ends recognition on its own sometimes, so restart it
     recognition.onend = () => {
-      if (!listeningRef.current) return;
+      // never restart an old recognizer, or one that was muted
+      if (!listeningRef.current || mutedRef.current || recognitionRef.current !== recognition) return;
       try {
         recognition.start();
       } catch {
@@ -221,11 +249,12 @@ export default function App() {
     listeningRef.current = true;
     recognition.start();
     setListening(true);
-    setStatus('Listening. Say what you want to do.');
+    if (announce) setStatus('Listening. Say what you want to do.');
   }
 
   // the side panel can't show the mic prompt, so open a setup tab the first time
   async function toggleListening() {
+    if (mutedRef.current) return toggleDemoMute(); // the big mic button also unmutes
     if (listeningRef.current) {
       stopListening();
       return setStatus('Stopped listening.');
@@ -261,14 +290,20 @@ export default function App() {
     <main>
       <header>
         <h1>Access OS</h1>
-        <span className={listening ? 'dot on' : 'dot'} aria-hidden="true" />
+        <span className={muted ? 'dot muted' : listening ? 'dot on' : 'dot'} aria-hidden="true" />
       </header>
 
       <button type="button" className="mic" onClick={() => void toggleListening()} aria-pressed={listening}
         aria-label={listening ? 'Stop listening' : 'Start listening'}>
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 15a3 3 0 0 0 3-3V6a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3Zm6-3a6 6 0 0 1-12 0m6 6v3m-3 0h6" /></svg>
       </button>
-      <p className="hint">{listening ? 'Listening, just talk' : 'Tap to talk'}</p>
+      <p className="hint">{muted ? 'Mic muted for demo' : listening ? 'Listening, just talk' : 'Tap to talk'}</p>
+      {(listening || muted) && (
+        <button type="button" className="demo-mute" onClick={toggleDemoMute} aria-pressed={muted}
+          aria-label={muted ? 'Resume listening' : 'Mute microphone for demo'}>
+          {muted ? 'Resume listening' : 'Mute for demo'}
+        </button>
+      )}
 
       <p role="status" className="status">{status}</p>
       {progress && <p className="progress">{progress}</p>}
